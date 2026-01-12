@@ -3,15 +3,61 @@
 # Training script for VSA-MoE integrated with nanochat
 # This demonstrates how to train a small model with VSA-based MoE routing
 
+# Setup environment
+export OMP_NUM_THREADS=1
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+mkdir -p $NANOCHAT_BASE_DIR
+
+# Wandb setup (optional)
+# Set WANDB_RUN environment variable to enable wandb logging
+# Example: WANDB_RUN=vsa_moe_test ./train_vsa_moe.sh
+if [ -z "$WANDB_RUN" ]; then
+    WANDB_RUN="dummy"  # "dummy" skips wandb logging
+fi
+
 echo "Setting up VSA-MoE training..."
 echo "=================================================="
+echo "WANDB_RUN: $WANDB_RUN"
+echo "Base directory: $NANOCHAT_BASE_DIR"
 
-# Download tokenizer and data if not present
+# Python venv setup (if needed)
+if [ ! -d ".venv" ]; then
+    echo "Setting up Python environment..."
+    command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+    uv venv
+    uv sync
+fi
+source .venv/bin/activate
+
+# Setup tokenizer and data
 if [ ! -f "tokenizer.pkl" ]; then
-    echo "Downloading tokenizer and data (this may take a few minutes)..."
-    uv run python -m nanochat.dataset -n 1
+    echo "Tokenizer not found. Setting up tokenizer and data..."
+    echo "------------------------------------------------"
+    
+    # Download initial data shards for tokenizer training
+    echo "Downloading data shards..."
+    uv run python -m nanochat.dataset -n 8
+    
+    # Train tokenizer (smaller vocab for faster training)
+    echo "Training tokenizer..."
+    uv run python -m scripts.tok_train --max_chars=500000000 --vocab_size=32768
+    
+    # Evaluate tokenizer
+    echo "Evaluating tokenizer..."
+    uv run python -m scripts.tok_eval
+    
+    # Download more data shards for training (in background)
+    echo "Downloading additional data shards for training..."
+    uv run python -m nanochat.dataset -n 30 &
+    DATASET_DOWNLOAD_PID=$!
 else
-    echo "Tokenizer found, skipping download."
+    echo "Tokenizer found, skipping setup."
+fi
+
+# Wait for background downloads if any
+if [ ! -z "$DATASET_DOWNLOAD_PID" ]; then
+    echo "Waiting for dataset download to complete..."
+    wait $DATASET_DOWNLOAD_PID
 fi
 
 echo ""
@@ -20,7 +66,7 @@ echo "=================================================="
 
 # Small model with MoE (approximately 124M params with experts)
 uv run python -m scripts.base_train \
-    --run="vsa_moe_test" \
+    --run="$WANDB_RUN" \
     --depth=8 \
     --aspect_ratio=64 \
     --head_dim=64 \
