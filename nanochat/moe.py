@@ -9,14 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Dict, Optional
-import sys
-import os
-
-# Add parent directory to path to import VSA modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
-from routers import HRRRouter, VSARouterConfig
-from moe_block import MoEAuxLosses
+from nanochat.routers import HRRRouter, VSARouterConfig
+from nanochat.moe_block import MoEAuxLosses
 
 
 class MoELayer(nn.Module):
