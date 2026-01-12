@@ -3,6 +3,18 @@
 # Training script for VSA-MoE integrated with nanochat
 # This demonstrates how to train a small model with VSA-based MoE routing
 
+echo "Setting up VSA-MoE training..."
+echo "=================================================="
+
+# Download tokenizer and data if not present
+if [ ! -f "tokenizer.pkl" ]; then
+    echo "Downloading tokenizer and data (this may take a few minutes)..."
+    uv run python -m nanochat.dataset -n 1
+else
+    echo "Tokenizer found, skipping download."
+fi
+
+echo ""
 echo "Training a small 124M model with VSA-MoE routing..."
 echo "=================================================="
 
