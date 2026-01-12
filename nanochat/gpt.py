@@ -30,11 +30,17 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
 try:
     from kernels import get_kernel
-    flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-except (ImportError, FileNotFoundError):
+    # Only try to use FA3 on H100 GPUs
+    import torch
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9:
+        flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    else:
+        flash_attn = None
+        print("Info: Using standard attention (Flash Attention 3 requires H100 GPUs)")
+except (ImportError, FileNotFoundError, RuntimeError) as e:
     # Fallback to standard attention for platforms without FA3 support
     flash_attn = None
-    print("Warning: Flash Attention 3 not available, using standard attention")
+    print(f"Info: Using standard attention - {str(e)[:100]}")
 
 @dataclass
 class GPTConfig:
@@ -124,6 +130,12 @@ class CausalSelfAttention(nn.Module):
                     kv_cache.advance(T)
         else:
             # Fallback to standard PyTorch attention
+            # Handle KV cache if present
+            if kv_cache is not None:
+                # For standard attention, we need to handle cache differently
+                # Since FA3 KVCache expects different format, skip for now
+                raise NotImplementedError("KV cache not implemented for standard attention fallback. Use Flash Attention 3 or inference without cache.")
+            
             # Expand k and v for GQA if needed
             if self.n_kv_head < self.n_head:
                 k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
