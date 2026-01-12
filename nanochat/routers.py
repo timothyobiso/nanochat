@@ -15,7 +15,7 @@ from torch import Tensor
 from typing import Tuple, Optional
 from dataclasses import dataclass
 
-from vsa_ops import VSAOps, FPEOps, ResonatorOps
+from nanochat.vsa_ops import VSAOps, FPEOps, ResonatorOps
 
 
 @dataclass

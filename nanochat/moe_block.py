@@ -15,7 +15,7 @@ from torch import Tensor
 from typing import Tuple, Dict, Optional, List
 from dataclasses import dataclass, field
 
-from routers import VSARouterConfig, create_router
+from nanochat.routers import VSARouterConfig, create_router
 
 
 @dataclass
