@@ -28,8 +28,13 @@ import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Official docs of FA3 label it as "beta" and want you to install FA3 from source, which is a pain.
 # Wishing for official FA3 wheels soon, for now this seems to be a fast way to get them (ty varunneal)
-from kernels import get_kernel
-flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+try:
+    from kernels import get_kernel
+    flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+except (ImportError, FileNotFoundError):
+    # Fallback to standard attention for platforms without FA3 support
+    flash_attn = None
+    print("Warning: Flash Attention 3 not available, using standard attention")
 
 @dataclass
 class GPTConfig:
@@ -43,6 +48,16 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
+    
+    # MoE configuration
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    moe_layer_freq: int = 2  # Apply MoE every N layers (0 = no MoE, 2 = every other layer)
+    vsa_type: str = "hrr"  # VSA router type
+    
+    # MoE loss coefficients
+    load_balance_coef: float = 0.01
+    router_z_loss_coef: float = 0.001
 
 
 def norm(x):
@@ -90,22 +105,37 @@ class CausalSelfAttention(nn.Module):
         # Attention with Flash Attention 3
         # FA3 handles GQA automatically when n_kv_heads < n_heads
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if flash_attn is not None:
+            if kv_cache is None:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Inference: use flash_attn_with_kvcache which handles cache management
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                # Advance position after last layer processes
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Fallback to standard PyTorch attention
+            # Expand k and v for GQA if needed
+            if self.n_kv_head < self.n_head:
+                k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+                v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+            
+            # Standard scaled dot-product attention
+            y = F.scaled_dot_product_attention(
+                q.transpose(1, 2),  # (B, H, T, D)
+                k.transpose(1, 2),  # (B, H, T, D)
+                v.transpose(1, 2),  # (B, H, T, D)
+                is_causal=True,
+            ).transpose(1, 2)  # Back to (B, T, H, D)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -130,11 +160,31 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        
+        # Use MoE for specified layers, regular MLP for others
+        use_moe = (config.moe_layer_freq > 0 and 
+                   layer_idx % config.moe_layer_freq == config.moe_layer_freq - 1)
+        
+        if use_moe:
+            from nanochat.moe import MoELayer
+            self.mlp = MoELayer(config)
+            self.is_moe = True
+        else:
+            self.mlp = MLP(config)
+            self.is_moe = False
 
     def forward(self, x, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        
+        if self.is_moe:
+            h = norm(x)
+            moe_out, aux_outputs = self.mlp(h)
+            x = x + moe_out
+            # Store aux outputs for loss collection
+            self.aux_outputs = aux_outputs
+        else:
+            x = x + self.mlp(norm(x))
+        
         return x
 
 
@@ -203,8 +253,23 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            
+            # Initialize MLP or MoE weights
+            if hasattr(block, 'is_moe') and block.is_moe:
+                # Initialize MoE layer weights
+                from nanochat.moe import MoELayer
+                if isinstance(block.mlp, MoELayer):
+                    # Initialize router weights
+                    if hasattr(block.mlp.router, 'proj'):
+                        torch.nn.init.xavier_uniform_(block.mlp.router.proj.weight)
+                    # Initialize expert MLPs
+                    for expert in block.mlp.experts:
+                        torch.nn.init.uniform_(expert['c_fc'].weight, -s, s)
+                        torch.nn.init.zeros_(expert['c_proj'].weight)
+            else:
+                # Regular MLP
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         with torch.no_grad():

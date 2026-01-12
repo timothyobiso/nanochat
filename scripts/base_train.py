@@ -43,6 +43,13 @@ parser.add_argument("--aspect_ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head_dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length")
 parser.add_argument("--window_pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# MoE arguments
+parser.add_argument("--num_experts", type=int, default=8, help="number of experts in MoE layers")
+parser.add_argument("--num_experts_per_tok", type=int, default=2, help="number of experts per token (top-k routing)")
+parser.add_argument("--moe_layer_freq", type=int, default=0, help="apply MoE every N layers (0 = no MoE, 2 = every other layer)")
+parser.add_argument("--vsa_type", type=str, default="hrr", help="VSA router type: hrr|fpe|resonator|linear")
+parser.add_argument("--load_balance_coef", type=float, default=0.01, help="coefficient for load balancing loss")
+parser.add_argument("--router_z_loss_coef", type=float, default=0.001, help="coefficient for router z-loss")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -140,7 +147,22 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern)
+model_config_kwargs = dict(
+    sequence_len=args.max_seq_len, 
+    vocab_size=vocab_size, 
+    n_layer=num_layers, 
+    n_head=num_heads, 
+    n_kv_head=num_kv_heads, 
+    n_embd=model_dim, 
+    window_pattern=args.window_pattern,
+    # MoE parameters
+    num_experts=args.num_experts,
+    num_experts_per_tok=args.num_experts_per_tok,
+    moe_layer_freq=args.moe_layer_freq,
+    vsa_type=args.vsa_type,
+    load_balance_coef=args.load_balance_coef,
+    router_z_loss_coef=args.router_z_loss_coef,
+)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -352,7 +374,22 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            lm_loss = model(x, y)
+            
+            # Add MoE auxiliary losses if MoE is enabled
+            if model_config_kwargs.get('moe_layer_freq', 0) > 0:
+                from nanochat.moe import compute_moe_auxiliary_losses
+                aux_losses = compute_moe_auxiliary_losses(model, config)
+                
+                # Combine losses
+                load_balance_loss = aux_losses.get('load_balance_loss', 0.0)
+                router_z_loss = aux_losses.get('router_z_loss', 0.0)
+                
+                loss = lm_loss + (config.load_balance_coef * load_balance_loss + 
+                                  config.router_z_loss_coef * router_z_loss)
+            else:
+                loss = lm_loss
+                
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
