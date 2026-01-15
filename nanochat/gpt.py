@@ -31,6 +31,10 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    use_moe: bool = False
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    moe_layer_freq: int = 2
 
 
 def norm(x):
@@ -120,16 +124,97 @@ class MLP(nn.Module):
         return x
 
 
+class MoELayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.n_embd = config.n_embd
+        
+        # Router: linear layer to select experts
+        self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        
+        # Experts: each is identical to the original MLP
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.num_experts)])
+        
+    def forward(self, x):
+        B, T, C = x.shape
+        
+        # Reshape for routing
+        x_flat = x.view(-1, C)  # [B*T, C]
+        
+        # Compute router scores
+        router_logits = self.router(x_flat)  # [B*T, num_experts]
+        router_probs = F.softmax(router_logits, dim=-1)  # [B*T, num_experts]
+        
+        # Select top-k experts
+        topk_probs, topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)  # [B*T, k]
+        
+        # Normalize the top-k probabilities 
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # [B*T, k]
+        
+        # Process tokens through selected experts
+        output = torch.zeros_like(x_flat)  # [B*T, C]
+        
+        # For each expert, process the tokens assigned to it
+        for expert_idx in range(self.num_experts):
+            # Find which tokens select this expert
+            expert_mask = (topk_indices == expert_idx).any(dim=-1)  # [B*T]
+            
+            if expert_mask.any():
+                # Get tokens for this expert
+                expert_input = x_flat[expert_mask]  # [num_selected, C]
+                
+                # Process through expert
+                expert_output = self.experts[expert_idx](expert_input.view(-1, C))  # [num_selected, C]
+                
+                # Get weights for this expert from selected tokens
+                # We need to gather the weights where this expert was selected
+                weights_for_expert = torch.zeros(B*T, device=x.device)
+                for k in range(self.num_experts_per_tok):
+                    mask_k = topk_indices[:, k] == expert_idx
+                    weights_for_expert[mask_k] = topk_probs[mask_k, k]
+                
+                # Add weighted expert output
+                output[expert_mask] += weights_for_expert[expert_mask].unsqueeze(-1) * expert_output
+        
+        # Reshape back to original shape
+        output = output.view(B, T, C)
+        
+        # Store aux loss info for load balancing
+        self.aux_loss_info = {
+            'router_probs': router_probs,  # [B*T, num_experts]
+            'expert_indices': topk_indices,  # [B*T, k]
+        }
+        
+        return output
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        
+        # Determine if this layer should use MoE
+        self.use_moe = config.use_moe and (layer_idx % config.moe_layer_freq == (config.moe_layer_freq - 1))
+        
+        if self.use_moe:
+            self.mlp = MoELayer(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        mlp_out = self.mlp(norm(x))
+        x = x + mlp_out
+        
+        # Collect aux loss info if this is an MoE layer
+        aux_loss_info = None
+        if self.use_moe:
+            aux_loss_info = self.mlp.aux_loss_info
+            
+        return x, aux_loss_info
 
 
 class GPT(nn.Module):
@@ -194,8 +279,18 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            
+            # Initialize MLP or MoE layer
+            if block.use_moe:
+                # Initialize router
+                torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
+                # Initialize each expert
+                for expert in block.mlp.experts:
+                    torch.nn.init.uniform_(expert.c_fc.weight, -s, s)
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         with torch.no_grad():
@@ -309,9 +404,16 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        
+        # Collect auxiliary loss info from MoE layers
+        moe_aux_loss_info = []
+        
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin, kv_cache)
+            block_out, aux_info = block(x, cos_sin, kv_cache)
+            x = block_out
+            if aux_info is not None:
+                moe_aux_loss_info.append(aux_info)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -325,7 +427,35 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            
+            # Compute MoE auxiliary loss if we have MoE layers
+            aux_loss = 0.0
+            if moe_aux_loss_info:
+                for aux_info in moe_aux_loss_info:
+                    router_probs = aux_info['router_probs']
+                    expert_indices = aux_info['expert_indices']
+                    
+                    # Compute load balance loss for this layer
+                    num_experts = router_probs.shape[-1]
+                    
+                    # Fraction of tokens routed to each expert (based on hard assignments)
+                    tokens_per_expert = torch.zeros(num_experts, device=router_probs.device)
+                    for k in range(expert_indices.shape[1]):
+                        tokens_per_expert.scatter_add_(0, expert_indices[:, k], 
+                                                      torch.ones_like(expert_indices[:, k], dtype=torch.float))
+                    tokens_per_expert = tokens_per_expert / expert_indices.shape[0]
+                    
+                    # Average router probability for each expert
+                    router_prob_per_expert = router_probs.mean(dim=0)
+                    
+                    # Aux loss: dot product (encourages uniform distribution)
+                    layer_aux_loss = num_experts * (tokens_per_expert * router_prob_per_expert).sum()
+                    aux_loss = aux_loss + layer_aux_loss
+                
+                # Average across MoE layers
+                aux_loss = aux_loss / len(moe_aux_loss_info)
+            
+            return loss, aux_loss
         else:
             # inference: just return the logits directly
             return logits

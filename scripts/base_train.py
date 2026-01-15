@@ -69,6 +69,12 @@ parser.add_argument("--sample_every", type=int, default=2000, help="sample from 
 parser.add_argument("--save_every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model_tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# MoE parameters
+parser.add_argument("--use_moe", action="store_true", help="Enable MoE layers")
+parser.add_argument("--num_experts", type=int, default=8, help="Total number of experts")
+parser.add_argument("--num_experts_per_tok", type=int, default=2, help="Top-k experts selected per token")
+parser.add_argument("--moe_layer_freq", type=int, default=2, help="MoE every N layers (1=all layers, 2=every other, etc.)")
+parser.add_argument("--moe_aux_loss_coef", type=float, default=0.01, help="Coefficient for load balancing auxiliary loss")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -139,7 +145,18 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(
+    sequence_len=args.max_seq_len, 
+    vocab_size=vocab_size, 
+    n_layer=num_layers, 
+    n_head=num_heads, 
+    n_kv_head=num_kv_heads, 
+    n_embd=model_dim,
+    use_moe=args.use_moe,
+    num_experts=args.num_experts,
+    num_experts_per_tok=args.num_experts_per_tok,
+    moe_layer_freq=args.moe_layer_freq,
+)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -351,10 +368,17 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+            model_output = model(x, y)
+            # Handle both regular and MoE outputs
+            if isinstance(model_output, tuple):
+                loss, aux_loss = model_output
+                # Add weighted aux loss for MoE
+                total_loss = loss + args.moe_aux_loss_coef * aux_loss
+            else:
+                total_loss = loss = model_output
+        train_loss = loss.detach() # for logging (main loss only)
+        total_loss = total_loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        total_loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizers
     lrm = get_lr_multiplier(step)
