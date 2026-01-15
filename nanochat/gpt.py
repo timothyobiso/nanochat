@@ -170,7 +170,7 @@ class MoELayer(nn.Module):
                 
                 # Get weights for this expert from selected tokens
                 # We need to gather the weights where this expert was selected
-                weights_for_expert = torch.zeros(B*T, device=x.device)
+                weights_for_expert = torch.zeros(B*T, device=x.device, dtype=x.dtype)
                 for k in range(self.num_experts_per_tok):
                     mask_k = topk_indices[:, k] == expert_idx
                     weights_for_expert[mask_k] = topk_probs[mask_k, k]
