@@ -42,6 +42,11 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect_ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head_dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length")
+# Mixture of Experts (MoE)
+parser.add_argument("--num_experts", type=int, default=8, help="number of expert MLPs per MoE layer")
+parser.add_argument("--num_experts_per_tok", type=int, default=2, help="top-K experts activated per token")
+parser.add_argument("--moe_layer_freq", type=int, default=0, help="replace MLP with MoE every N layers (0=disabled, 1=every layer, 2=every other)")
+parser.add_argument("--moe_aux_loss_coeff", type=float, default=0.01, help="MoE load-balancing auxiliary loss coefficient")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -139,7 +144,7 @@ if args.depth != 12:
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, num_experts=args.num_experts, num_experts_per_tok=args.num_experts_per_tok, moe_layer_freq=args.moe_layer_freq, moe_aux_loss_coeff=args.moe_aux_loss_coeff)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)

@@ -31,6 +31,11 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Mixture of Experts (MoE) config
+    num_experts: int = 8           # total number of expert MLPs per MoE layer
+    num_experts_per_tok: int = 2   # top-K experts activated per token
+    moe_layer_freq: int = 0        # replace MLP with MoE every N layers (0 = disabled, 1 = every layer, 2 = every other)
+    moe_aux_loss_coeff: float = 0.01  # load-balancing auxiliary loss coefficient
 
 
 def norm(x):
@@ -120,16 +125,62 @@ class MLP(nn.Module):
         return x
 
 
+class MoELayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.num_experts)])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)  # (B*T, C)
+        # Router: compute gating logits and select top-K experts per token
+        router_logits = self.router(x_flat)  # (B*T, num_experts)
+        top_k_logits, top_k_indices = torch.topk(router_logits, self.num_experts_per_tok, dim=-1)  # (B*T, K)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (B*T, K)
+        # Dispatch tokens to experts and combine outputs
+        out = torch.zeros_like(x_flat)
+        for k in range(self.num_experts_per_tok):
+            expert_indices = top_k_indices[:, k]  # (B*T,)
+            weights = top_k_weights[:, k]  # (B*T,)
+            for e in range(self.num_experts):
+                mask = expert_indices == e  # (B*T,)
+                if mask.any():
+                    expert_input = x_flat[mask]  # (n_tokens, C)
+                    expert_output = self.experts[e](expert_input)  # (n_tokens, C)
+                    out[mask] += weights[mask].unsqueeze(-1) * expert_output
+        # Load-balancing auxiliary loss (Mixtral-style)
+        # f_i = fraction of tokens routed to expert i, p_i = mean router prob for expert i
+        router_probs = F.softmax(router_logits, dim=-1)  # (B*T, num_experts)
+        # Fraction of tokens dispatched to each expert (from top-k selection)
+        one_hot = F.one_hot(top_k_indices, self.num_experts).float()  # (B*T, K, num_experts)
+        tokens_per_expert = one_hot.sum(dim=1).mean(dim=0)  # (num_experts,)
+        mean_prob_per_expert = router_probs.mean(dim=0)  # (num_experts,)
+        aux_loss = self.num_experts * (tokens_per_expert * mean_prob_per_expert).sum()
+        return out.view(B, T, C), aux_loss
+
+
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, is_moe=False):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.is_moe = is_moe
+        if is_moe:
+            self.moe = MoELayer(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        if self.is_moe:
+            moe_out, aux_loss = self.moe(norm(x))
+            x = x + moe_out
+            return x, aux_loss
+        else:
+            x = x + self.mlp(norm(x))
+            return x, 0
 
 
 class GPT(nn.Module):
@@ -146,9 +197,14 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} to be divisible by {pad_vocab_size_to}")
+        # Determine which layers are MoE (if moe_layer_freq > 0, every Nth layer is MoE)
+        def _is_moe_layer(layer_idx):
+            if config.moe_layer_freq <= 0:
+                return False
+            return layer_idx % config.moe_layer_freq == 0
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, is_moe=_is_moe_layer(layer_idx)) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -194,8 +250,16 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.is_moe:
+                # Router: small normal init so routing starts near-uniform
+                torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
+                # Expert MLPs: same init as dense MLP
+                for expert in block.moe.experts:
+                    torch.nn.init.uniform_(expert.c_fc.weight, -s, s)
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         with torch.no_grad():
@@ -241,11 +305,19 @@ class GPT(nn.Module):
         This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+        For MoE layers, only top-K out of N experts are active per token, so we exclude inactive expert params.
         """
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
+        # For MoE layers, exclude the inactive expert params from FLOPs count
+        moe_inactive_params = 0
+        for block in self.transformer.h:
+            if block.is_moe:
+                expert_params = sum(p.numel() for p in block.moe.experts[0].parameters())
+                inactive = (self.config.num_experts - self.config.num_experts_per_tok) * expert_params
+                moe_inactive_params += inactive
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = 6 * (nparams - nparams_embedding - moe_inactive_params) + 12 * l * h * q * t
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -256,8 +328,21 @@ class GPT(nn.Module):
         My own experiments in nanochat confirm the Chinchilla approach gives the much cleaner scaling law.
         Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper <- good).
         Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper <- bad)
+        For MoE models, also reports total MoE params and active-per-token MoE params.
         """
         nparams = sum(p.numel() for p in self.parameters())
+        # Count MoE-specific params (total and active per token)
+        moe_total_params = 0
+        moe_active_params = 0
+        for block in self.transformer.h:
+            if block.is_moe:
+                moe_block_params = sum(p.numel() for p in block.moe.parameters())
+                moe_total_params += moe_block_params
+                router_params = sum(p.numel() for p in block.moe.router.parameters())
+                expert_params = sum(p.numel() for p in block.moe.experts[0].parameters())
+                moe_active_params += router_params + self.config.num_experts_per_tok * expert_params
+        if moe_total_params > 0:
+            print0(f"MoE params: {moe_total_params:,} total, {moe_active_params:,} active per token")
         return nparams
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
@@ -309,9 +394,11 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        total_aux_loss = 0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin, kv_cache)
+            x, aux_loss = block(x, cos_sin, kv_cache)
+            total_aux_loss = total_aux_loss + aux_loss
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -325,6 +412,9 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Add MoE load-balancing auxiliary loss
+            if total_aux_loss != 0:
+                loss = loss + self.config.moe_aux_loss_coeff * total_aux_loss
             return loss
         else:
             # inference: just return the logits directly
