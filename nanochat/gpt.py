@@ -133,6 +133,7 @@ class MoELayer(nn.Module):
         self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.num_experts)])
 
+    @torch.compiler.disable
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.view(-1, C)  # (B*T, C)
