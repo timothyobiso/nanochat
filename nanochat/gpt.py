@@ -36,6 +36,7 @@ class GPTConfig:
     num_experts_per_tok: int = 2   # top-K experts activated per token
     moe_layer_freq: int = 0        # replace MLP with MoE every N layers (0 = disabled, 1 = every layer, 2 = every other)
     moe_aux_loss_coeff: float = 0.01  # load-balancing auxiliary loss coefficient
+    moe_router_type: str = 'linear'   # 'linear', 'vsa_random', 'vsa_fpe'
 
 
 def norm(x):
@@ -125,12 +126,81 @@ class MLP(nn.Module):
         return x
 
 
+# --- VSA / HRR (Holographic Reduced Representations) ---
+
+def hrr_bind(a, b):
+    """Circular convolution (binding). a, b: (..., d) -> (..., d)"""
+    return torch.fft.ifft(torch.fft.fft(a, dim=-1) * torch.fft.fft(b, dim=-1), dim=-1).real
+
+def hrr_unbind(s, key):
+    """Circular correlation (unbinding). s: (..., d), key: (..., d) -> (..., d)"""
+    return torch.fft.ifft(torch.fft.fft(s, dim=-1) * torch.fft.fft(key, dim=-1).conj(), dim=-1).real
+
+def make_fpe_keys(base, num_keys):
+    """Fractional Power Encoding. base: (d,) -> (num_keys, d)"""
+    base_freq = torch.fft.fft(base)
+    keys = []
+    for i in range(num_keys):
+        p = i / max(num_keys - 1, 1)
+        mag = base_freq.abs().pow(p)
+        phase = base_freq.angle() * p
+        key_freq = mag * torch.exp(1j * phase)
+        keys.append(torch.fft.ifft(key_freq).real)
+    return torch.stack(keys)
+
+
+class VSARouter(nn.Module):
+    """VSA/HRR router: bundles (key, id) pairs into a single holographic memory.
+    Routes by unbinding the token from memory and comparing to expert identifiers.
+    No learnable parameters. Supports meta device init (actual data filled in init_buffers)."""
+
+    def __init__(self, dim, num_experts, mode='random'):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.mode = mode
+        # Register buffers with correct shapes (may be meta tensors at this point)
+        self.register_buffer('memory', torch.zeros(dim))
+        self.register_buffer('expert_ids', torch.zeros(num_experts, dim))
+        self.register_buffer('expert_keys', torch.zeros(num_experts, dim))
+
+    def init_buffers(self):
+        """Compute and fill VSA buffers with actual data. Called from GPT.init_weights()."""
+        device = self.memory.device
+        if self.mode == 'random':
+            keys = torch.randn(self.num_experts, self.dim, device=device)
+        elif self.mode == 'fpe':
+            keys = make_fpe_keys(torch.randn(self.dim, device=device), self.num_experts)
+        else:
+            raise ValueError(f"Unknown VSA router mode: {self.mode}")
+        keys = F.normalize(keys, dim=-1)
+        ids = F.normalize(torch.randn(self.num_experts, self.dim, device=device), dim=-1)
+        memory = sum(hrr_bind(keys[i], ids[i]) for i in range(self.num_experts))
+        self.memory.copy_(memory)
+        self.expert_ids.copy_(ids)
+        self.expert_keys.copy_(keys)
+
+    def forward(self, x):
+        """x: (N, d) -> router_logits: (N, num_experts)"""
+        # FFT requires float32
+        retrieved = hrr_unbind(self.memory.float().unsqueeze(0), x.float())
+        scores = retrieved @ self.expert_ids.float().T
+        return scores.to(x.dtype)
+
+
 class MoELayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        # Router
+        if config.moe_router_type == 'linear':
+            self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        elif config.moe_router_type in ('vsa_random', 'vsa_fpe'):
+            mode = 'random' if config.moe_router_type == 'vsa_random' else 'fpe'
+            self.router = VSARouter(config.n_embd, config.num_experts, mode=mode)
+        else:
+            raise ValueError(f"Unknown moe_router_type: {config.moe_router_type}")
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.num_experts)])
 
     @torch.compiler.disable
@@ -252,8 +322,13 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.is_moe:
-                # Router: small normal init so routing starts near-uniform
-                torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
+                # Router init
+                if hasattr(block.moe.router, 'weight'):
+                    # Linear router: small normal init so routing starts near-uniform
+                    torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
+                elif hasattr(block.moe.router, 'init_buffers'):
+                    # VSA router: compute and fill holographic memory buffers
+                    block.moe.router.init_buffers()
                 # Expert MLPs: same init as dense MLP
                 for expert in block.moe.experts:
                     torch.nn.init.uniform_(expert.c_fc.weight, -s, s)
