@@ -23,7 +23,7 @@ def log0(message):
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were dense (no MoE). Default moe_layer_freq=0 disables MoE entirely.
-    moe_defaults = {"num_experts": 8, "num_experts_per_tok": 2, "moe_layer_freq": 0, "moe_aux_loss_coeff": 0.01}
+    moe_defaults = {"num_experts": 8, "num_experts_per_tok": 2, "moe_layer_freq": 0, "moe_aux_loss_coeff": 0.01, "moe_router_type": "linear"}
     for key, default in moe_defaults.items():
         if key not in model_config_kwargs:
             model_config_kwargs[key] = default
