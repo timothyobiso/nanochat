@@ -36,7 +36,7 @@ class GPTConfig:
     num_experts_per_tok: int = 2   # top-K experts activated per token
     moe_layer_freq: int = 0        # replace MLP with MoE every N layers (0 = disabled, 1 = every layer, 2 = every other)
     moe_aux_loss_coeff: float = 0.01  # load-balancing auxiliary loss coefficient
-    moe_router_type: str = 'linear'   # 'linear', 'vsa_random', 'vsa_fpe'
+    moe_router_type: str = 'linear'   # 'linear', 'vsa_random', 'vsa_fpe', 'hash'
 
 
 def norm(x):
@@ -187,6 +187,21 @@ class VSARouter(nn.Module):
         scores = retrieved @ self.expert_ids.float().T
         return scores.to(x.dtype)
 
+class HashRouter(nn.Module):
+    """Parameter-free context-blind router. Assigns by token position."""
+    def __init__(self, num_experts, num_experts_per_tok):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+
+    def forward(self, x):
+        N = x.shape[0]
+        idx = torch.arange(N, device=x.device)
+        logits = torch.full((N, self.num_experts), -1e9, device=x.device, dtype=x.dtype)
+        for k in range(self.num_experts_per_tok):
+            ek = (idx + k) % self.num_experts
+            logits.scatter_(1, ek.unsqueeze(1), float(self.num_experts_per_tok - k))
+        return logits
 
 class MoELayer(nn.Module):
     def __init__(self, config):
@@ -196,6 +211,8 @@ class MoELayer(nn.Module):
         # Router
         if config.moe_router_type == 'linear':
             self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        elif config.moe_router_type == 'hash':
+            self.router = HashRouter(config.num_experts, config.num_experts_per_tok)
         elif config.moe_router_type in ('vsa_random', 'vsa_fpe'):
             mode = 'random' if config.moe_router_type == 'vsa_random' else 'fpe'
             self.router = VSARouter(config.n_embd, config.num_experts, mode=mode)
@@ -209,6 +226,8 @@ class MoELayer(nn.Module):
         x_flat = x.view(-1, C)  # (B*T, C)
         # Router: compute gating logits and select top-K experts per token
         router_logits = self.router(x_flat)  # (B*T, num_experts)
+        if self.training:                                            # ADD
+            router_logits = router_logits + torch.randn_like(router_logits) * 0.01  # ADD
         top_k_logits, top_k_indices = torch.topk(router_logits, self.num_experts_per_tok, dim=-1)  # (B*T, K)
         top_k_weights = F.softmax(top_k_logits, dim=-1)  # (B*T, K)
         # Dispatch tokens to experts and combine outputs

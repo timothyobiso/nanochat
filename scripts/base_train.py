@@ -47,7 +47,7 @@ parser.add_argument("--num_experts", type=int, default=8, help="number of expert
 parser.add_argument("--num_experts_per_tok", type=int, default=2, help="top-K experts activated per token")
 parser.add_argument("--moe_layer_freq", type=int, default=0, help="replace MLP with MoE every N layers (0=disabled, 1=every layer, 2=every other)")
 parser.add_argument("--moe_aux_loss_coeff", type=float, default=0.01, help="MoE load-balancing auxiliary loss coefficient")
-parser.add_argument("--moe_router_type", type=str, default="linear", choices=["linear", "vsa_random", "vsa_fpe"], help="MoE router type")
+parser.add_argument("--moe_router_type", type=str, default="linear", choices=["linear", "vsa_random", "vsa_fpe", "hash"], help="MoE router type")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num_iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target_flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
