@@ -187,6 +187,23 @@ class VSARouter(nn.Module):
         scores = retrieved @ self.expert_ids.float().T
         return scores.to(x.dtype)
 
+class DirectFPERouter(nn.Module):
+    def __init__(self, dim, num_experts):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.register_buffer('expert_keys', torch.zeros(num_experts, dim))
+
+    def init_buffers(self):
+        device = self.expert_keys.device
+        keys = make_fpe_keys(torch.randn(self.dim, device=device), self.num_experts)
+        keys = F.normalize(keys, dim=-1)
+        self.expert_keys.copy_(keys)
+
+    def forward(self, x):
+        scores = x.float() @ self.expert_keys.float().T
+        return scores.to(x.dtype)
+
 class HashRouter(nn.Module):
     """Parameter-free context-blind router. Assigns by token position."""
     def __init__(self, num_experts, num_experts_per_tok):
@@ -211,6 +228,8 @@ class MoELayer(nn.Module):
         # Router
         if config.moe_router_type == 'linear':
             self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        elif config.moe_router_type == "direct_fpe":
+            self.router = DirectFPERouter(config.n_embd, config.num_experts)
         elif config.moe_router_type == 'hash':
             self.router = HashRouter(config.num_experts, config.num_experts_per_tok)
         elif config.moe_router_type in ('vsa_random', 'vsa_fpe'):
