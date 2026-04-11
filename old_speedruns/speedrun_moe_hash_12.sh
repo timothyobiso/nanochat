@@ -77,15 +77,15 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
-NPROC_PER_NODE=8
+NPROC_PER_NODE=2
 
 # VSA router type: 'vsa_random' or 'vsa_fpe'
 MOE_ROUTER_TYPE=${MOE_ROUTER_TYPE:-hash}
 
 # pretrain the d20 model with VSA MoE router
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target_param_data_ratio=20 --moe_layer_freq=2 --num_experts=8 --num_experts_per_tok=2 --device_batch_size=2 --moe_router_type=$MOE_ROUTER_TYPE --run=$WANDB_RUN --save_every 250 --model_tag=d12_hash --resume_from_step=13000
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=12 --target_param_data_ratio=20 --moe_layer_freq=2 --num_experts=8 --num_experts_per_tok=2 --device_batch_size=8 --moe_router_type=$MOE_ROUTER_TYPE --run=$WANDB_RUN --save_every 250 --model_tag=d12_hash
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss --device_batch_size=2 --model_tag=d12_hash
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss --device_batch_size=8 --model_tag=d12_hash
 # evaluate the model on CORE tasks
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval --model-tag=d12_hash
 
@@ -97,14 +97,14 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval --mo
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run midtraining and eval the model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN --device_batch_size=2 --model_tag=d12_hash
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN --device_batch_size=8 --model_tag=d12_hash
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid --model-tag=d12_hash
 
 # -----------------------------------------------------------------------------
 # Supervised Finetuning (domain adaptation to each sequence all by itself per row)
 
 # train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN --device_batch_size=2 --model_tag=d12_hash
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN --device_batch_size=8 --model_tag=d12_hash
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft --model-tag=d12_hash
 
 # chat with the model over CLI! Leave out the -p to chat interactively

@@ -1,124 +1,285 @@
 #!/bin/bash
+set -e
 
-# This script is the "Best ChatGPT clone that $100 can buy",
-# It is designed to run in ~4 hours on 8XH100 node at $3/GPU/hour.
+# ═══════════════════════════════════════════════════════════════════════════════
+# Unified MoE Training Speedrun
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces all speedrun_moe_*.sh scripts with a single parameterized version.
+#
+# Usage:
+#   bash speedrun.sh --router vsa_fpe --depth 8
+#   bash speedrun.sh --router hash --depth 4
+#   bash speedrun.sh --router direct_fpe --depth 10 --batch-size 1
+#   bash speedrun.sh --router clifford_quat_fpe --depth 8
+#
+# All options:
+#   --router TYPE      Router type: linear, hash, vsa_random, vsa_fpe, direct_fpe,
+#                      clifford_quat_fpe, clifford_quat_random, clifford_complex_fpe
+#                      (default: linear)
+#   --depth N          Model depth: 4, 8, 10, 12, 16, 20 (default: 8)
+#   --gpus N           Number of GPUs (default: 8)
+#   --batch-size N     Device batch size (default: 2)
+#   --tag TAG          Override model tag (default: auto-generated from depth+router)
+#   --resume STEP      Resume training from this step
+#   --save-every N     Checkpoint interval (default: 250)
+#   --experts N        Number of experts (default: 8)
+#   --top-k K          Experts per token (default: 2)
+#   --shards N         Data shards to download (default: auto from depth)
+#   --skip-setup       Skip venv/tokenizer/data setup (already done)
+#   --skip-data        Skip data download only
+#   --only STAGE       Run only: pretrain, eval, midtrain, sft, report
+#   --wandb RUN        Wandb run name (default: dummy)
+#
+# Examples:
+#   # Full pipeline, d8, FPE router
+#   bash speedrun.sh --router vsa_fpe --depth 8
+#
+#   # Just pretrain d10 FPE, resume from crash
+#   bash speedrun.sh --router vsa_fpe --depth 10 --resume 5750 --only pretrain
+#
+#   # Quick d4 sweep of all routers
+#   for r in hash linear vsa_random vsa_fpe direct_fpe; do
+#       bash speedrun.sh --router $r --depth 4
+#   done
+#
+#   # Clifford experiments
+#   bash speedrun.sh --router clifford_quat_fpe --depth 8
+#
+#   # 32 experts with top-4
+#   bash speedrun.sh --router vsa_fpe --depth 8 --experts 32 --top-k 4
 
-# 1) Example launch (simplest):
-# bash speedrun.sh
-# 2) Example launch in a screen session (because the run takes ~4 hours):
-# screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile speedrun.log -S speedrun bash speedrun.sh
+# ─────────────────────────────────────────────────────────────────────────────
+# Parse arguments
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Default intermediate artifacts directory is in ~/.cache/nanochat
-export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+ROUTER="linear"
+DEPTH=8
+GPUS=8
+BATCH_SIZE=2
+TAG=""
+RESUME=""
+SAVE_EVERY=250
+NUM_EXPERTS=8
+NUM_EXPERTS_PER_TOK=2
+SHARDS=""
+SKIP_SETUP=false
+SKIP_DATA=false
+ONLY=""
+WANDB_RUN="dummy"
 
-# -----------------------------------------------------------------------------
-# Python venv setup with uv
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --router)       ROUTER="$2"; shift 2 ;;
+        --depth)        DEPTH="$2"; shift 2 ;;
+        --gpus)         GPUS="$2"; shift 2 ;;
+        --batch-size)   BATCH_SIZE="$2"; shift 2 ;;
+        --tag)          TAG="$2"; shift 2 ;;
+        --resume)       RESUME="$2"; shift 2 ;;
+        --save-every)   SAVE_EVERY="$2"; shift 2 ;;
+        --experts)      NUM_EXPERTS="$2"; shift 2 ;;
+        --top-k)        NUM_EXPERTS_PER_TOK="$2"; shift 2 ;;
+        --shards)       SHARDS="$2"; shift 2 ;;
+        --skip-setup)   SKIP_SETUP=true; shift ;;
+        --skip-data)    SKIP_DATA=true; shift ;;
+        --only)         ONLY="$2"; shift 2 ;;
+        --wandb)        WANDB_RUN="$2"; shift 2 ;;
+        *)              echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
+# ─────────────────────────────────────────────────────────────────────────────
+# Derive model tag if not specified
+# ─────────────────────────────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------------
-# wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
-#    `wandb login`
-# 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
+if [ -z "$TAG" ]; then
+    case $ROUTER in
+        linear)                 TAG="d${DEPTH}" ;;
+        hash)                   TAG="d${DEPTH}_hash" ;;
+        vsa_random)             TAG="d${DEPTH}_random_vsa" ;;
+        vsa_fpe)                TAG="d${DEPTH}_fpe_vsa" ;;
+        direct_fpe)             TAG="d${DEPTH}_fpe_direct" ;;
+        clifford_quat_fpe)      TAG="d${DEPTH}_clifford_quat_fpe" ;;
+        clifford_quat_random)   TAG="d${DEPTH}_clifford_quat_random" ;;
+        clifford_complex_fpe)   TAG="d${DEPTH}_clifford_complex_fpe" ;;
+        clifford_complex_random) TAG="d${DEPTH}_clifford_complex_random" ;;
+        *)                      TAG="d${DEPTH}_${ROUTER}" ;;
+    esac
 fi
 
-# -----------------------------------------------------------------------------
-# During the course of the run, we will be writing markdown reports to the report/
-# directory in the base dir. This command clears it out and writes a header section
-# with a bunch of system info and a timestamp that marks the start of the run.
-python -m nanochat.report reset
+# Auto-detect shards needed from depth if not specified
+# ~295 * depth^3 params, 20:1 ratio, 4.8 chars/tok, 250M chars/shard
+if [ -z "$SHARDS" ]; then
+    case $DEPTH in
+        4)  SHARDS=8 ;;
+        8)  SHARDS=24 ;;
+        10) SHARDS=48 ;;
+        12) SHARDS=80 ;;
+        16) SHARDS=200 ;;
+        20) SHARDS=240 ;;
+        *)  SHARDS=240 ;;
+    esac
+fi
 
-# -----------------------------------------------------------------------------
-# Tokenizer
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Download the first ~2B characters of pretraining dataset
-# look at dev/repackage_data_reference.py for details on how this data was prepared
-# each data shard is ~250M chars
-# so we download 2e9 / 250e6 = 8 data shards at this point
-# each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
-# Immediately also kick off downloading more shards in the background while tokenizer trains
-# See comment below for why 240 is the right number here
-python -m nanochat.dataset -n 240 &
-DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max_chars=2000000000 --vocab_size=65536
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+export OMP_NUM_THREADS=1
+export NANOCHAT_BASE_DIR="/data/$(whoami)/.cache/nanochat"
+export UV_CACHE_DIR="/data/$(whoami)/.cache/uv"
+mkdir -p $NANOCHAT_BASE_DIR
 
-# -----------------------------------------------------------------------------
-# Base model (pretraining)
+# ─────────────────────────────────────────────────────────────────────────────
+# Print config
+# ─────────────────────────────────────────────────────────────────────────────
 
-# The d20 model is 561M parameters.
-# Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
-# Assume our tokenizer is 4.8 chars/token, this is 11.2B * 4.8 ~= 54B chars.
-# At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
-# Round up to 240 for safety. At ~100MB/shard, this downloads ~24GB of data to disk.
-# (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+echo "═══════════════════════════════════════════════════════════════"
+echo "  MoE Speedrun"
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Router:      $ROUTER"
+echo "  Depth:       $DEPTH"
+echo "  Tag:         $TAG"
+echo "  GPUs:        $GPUS"
+echo "  Batch size:  $BATCH_SIZE"
+echo "  Experts:     $NUM_EXPERTS (top-$NUM_EXPERTS_PER_TOK)"
+echo "  Data shards: $SHARDS"
+echo "  Save every:  $SAVE_EVERY"
+[ -n "$RESUME" ] && echo "  Resume from: step $RESUME"
+[ -n "$ONLY" ]   && echo "  Only stage:  $ONLY"
+echo "═══════════════════════════════════════════════════════════════"
 
-# Number of processes/GPUs to use
-NPROC_PER_NODE=8
+# ─────────────────────────────────────────────────────────────────────────────
+# Build the torchrun prefix and router args
+# ─────────────────────────────────────────────────────────────────────────────
 
-# pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target_param_data_ratio=20 --run=$WANDB_RUN
-# evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
-# evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+RUN="torchrun --standalone --nproc_per_node=$GPUS"
 
-# -----------------------------------------------------------------------------
-# Midtraining (teach the model conversation special tokens, tool use, multiple choice)
+# Router arg (linear is the default, so omit it)
+ROUTER_ARG=""
+if [ "$ROUTER" != "linear" ]; then
+    ROUTER_ARG="--moe_router_type=$ROUTER"
+fi
 
-# download 2.3MB of synthetic identity conversations to impart a personality to nanochat
-# see dev/gen_synthetic_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+# Resume arg
+RESUME_ARG=""
+if [ -n "$RESUME" ]; then
+    RESUME_ARG="--resume_from_step $RESUME"
+fi
 
-# run midtraining and eval the model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup (venv, tokenizer, data)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# -----------------------------------------------------------------------------
-# Supervised Finetuning (domain adaptation to each sequence all by itself per row)
+if [ "$SKIP_SETUP" = false ]; then
+    # Python venv
+    command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+    [ -d ".venv" ] || uv venv
+    uv sync --extra gpu
+fi
 
-# train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+source .venv/bin/activate
 
-# chat with the model over CLI! Leave out the -p to chat interactively
-# python -m scripts.chat_cli -p "Why is the sky blue?"
+if [ "$SKIP_SETUP" = false ]; then
+    # Report header
+    python -m nanochat.report reset
 
-# even better, chat with your model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web
+    # Tokenizer (only if not already trained)
+    if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.json" ]; then
+        python -m nanochat.dataset -n 8
+        python -m scripts.tok_train --max_chars=2000000000 --vocab_size=65536
+        python -m scripts.tok_eval
+    fi
+fi
 
-# -----------------------------------------------------------------------------
-# Reinforcement Learning. Optional, and currently only on GSM8K
-# (optional)
+# Data download
+if [ "$SKIP_DATA" = false ] && [ "$SKIP_SETUP" = false ]; then
+    echo "Downloading $SHARDS data shards..."
+    python -m nanochat.dataset -n $SHARDS
+fi
 
-# run reinforcement learning
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
-# eval the RL model only on GSM8K
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+# Identity conversations for midtraining
+curl -sL -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl \
+    https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl 2>/dev/null || true
 
-# -----------------------------------------------------------------------------
-# Generate the full report by putting together all the sections
-# report.md is the output and will be copied to current directory for convenience
-python -m nanochat.report generate
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: Pretrain
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ -z "$ONLY" ] || [ "$ONLY" = "pretrain" ]; then
+    echo ""
+    echo ">>> PRETRAIN: $TAG"
+    $RUN -m scripts.base_train -- \
+        --depth=$DEPTH \
+        --target_param_data_ratio=20 \
+        --moe_layer_freq=2 \
+        --num_experts=$NUM_EXPERTS \
+        --num_experts_per_tok=$NUM_EXPERTS_PER_TOK \
+        --device_batch_size=$BATCH_SIZE \
+        $ROUTER_ARG \
+        --run=$WANDB_RUN \
+        --save_every $SAVE_EVERY \
+        --model_tag=$TAG \
+        $RESUME_ARG
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: Base eval
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ -z "$ONLY" ] || [ "$ONLY" = "eval" ]; then
+    echo ""
+    echo ">>> BASE LOSS: $TAG"
+    $RUN -m scripts.base_loss --device_batch_size=$BATCH_SIZE --model_tag=$TAG
+
+    echo ""
+    echo ">>> BASE EVAL: $TAG"
+    $RUN -m scripts.base_eval --model-tag=$TAG
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: Midtrain
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ -z "$ONLY" ] || [ "$ONLY" = "midtrain" ]; then
+    echo ""
+    echo ">>> MIDTRAIN: $TAG"
+    $RUN -m scripts.mid_train -- --run=$WANDB_RUN --device_batch_size=$BATCH_SIZE --model_tag=$TAG
+
+    echo ""
+    echo ">>> MID EVAL: $TAG"
+    $RUN -m scripts.chat_eval -- -i mid --model-tag=$TAG
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: SFT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ -z "$ONLY" ] || [ "$ONLY" = "sft" ]; then
+    echo ""
+    echo ">>> SFT: $TAG"
+    $RUN -m scripts.chat_sft -- --run=$WANDB_RUN --device_batch_size=$BATCH_SIZE --model_tag=$TAG
+
+    echo ""
+    echo ">>> SFT EVAL: $TAG"
+    $RUN -m scripts.chat_eval -- -i sft --model-tag=$TAG
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ -z "$ONLY" ] || [ "$ONLY" = "report" ]; then
+    echo ""
+    echo ">>> REPORT: $TAG"
+    # Backup report before regenerating
+    [ -f "$NANOCHAT_BASE_DIR/report.md" ] && cp "$NANOCHAT_BASE_DIR/report.md" "$NANOCHAT_BASE_DIR/report_${TAG}_backup.md"
+    python -m nanochat.report generate
+    cp "$NANOCHAT_BASE_DIR/report.md" "$NANOCHAT_BASE_DIR/report_${TAG}.md"
+    echo "Report saved to $NANOCHAT_BASE_DIR/report_${TAG}.md"
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Done: $TAG"
+echo "═══════════════════════════════════════════════════════════════"
