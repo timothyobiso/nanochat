@@ -36,7 +36,7 @@ class GPTConfig:
     num_experts_per_tok: int = 2   # top-K experts activated per token
     moe_layer_freq: int = 0        # replace MLP with MoE every N layers (0 = disabled, 1 = every layer, 2 = every other)
     moe_aux_loss_coeff: float = 0.01  # load-balancing auxiliary loss coefficient
-    moe_router_type: str = 'linear'   # 'linear', 'vsa_random', 'vsa_fpe', 'hash'
+    moe_router_type: str = 'linear'   # 'linear', 'vsa_random', 'vsa_fpe', 'hash', 'direct_fpe', 'clifford_quat_fpe', 'clifford_quat_random', 'clifford_complex_fpe', 'clifford_complex_random'
 
 
 def norm(x):
@@ -149,6 +149,130 @@ def make_fpe_keys(base, num_keys):
     return torch.stack(keys)
 
 
+# --- Quaternion (Cl(0,2)) Binding Operations ---
+
+def quat_mul(a, b):
+    """Quaternion multiplication (Hamilton product), bin-wise. a, b: (..., d) -> (..., d). d must be divisible by 4."""
+    a = a.view(*a.shape[:-1], -1, 4)
+    b = b.view(*b.shape[:-1], -1, 4)
+    a0, a1, a2, a3 = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    b0, b1, b2, b3 = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    w = a0*b0 - a1*b1 - a2*b2 - a3*b3
+    x = a0*b1 + a1*b0 + a2*b3 - a3*b2
+    y = a0*b2 - a1*b3 + a2*b0 + a3*b1
+    z = a0*b3 + a1*b2 - a2*b1 + a3*b0
+    return torch.stack([w, x, y, z], dim=-1).flatten(-2)
+
+def quat_conj(a):
+    """Quaternion conjugate: negate imaginary parts. a: (..., d) -> (..., d)."""
+    a = a.view(*a.shape[:-1], -1, 4).clone()
+    a[..., 1:] *= -1
+    return a.flatten(-2)
+
+def quat_bind(a, b):
+    """Bind via quaternion multiplication."""
+    return quat_mul(a, b)
+
+def quat_unbind(memory, x):
+    """Unbind via multiplication by quaternion conjugate."""
+    return quat_mul(memory, quat_conj(x))
+
+def quat_normalize(q):
+    """Normalize each quaternion bin to unit norm."""
+    q = q.view(*q.shape[:-1], -1, 4)
+    norms = torch.sqrt((q ** 2).sum(dim=-1, keepdim=True)).clamp(min=1e-8)
+    return (q / norms).flatten(-2)
+
+def make_quat_fpe_keys(base_vec, num_keys):
+    """FPE on the quaternionic manifold. q^p = exp(p * log(q)) per bin.
+    base_vec: (d,) -> (num_keys, d). d must be divisible by 4."""
+    assert base_vec.shape[-1] % 4 == 0, f"Dim must be divisible by 4, got {base_vec.shape[-1]}"
+    base = quat_normalize(base_vec)
+    b = base.view(-1, 4)
+    # log(q): scalar = log|q|, vector = theta * u_hat
+    w, vec = b[..., 0], b[..., 1:]
+    full_norm = torch.sqrt((b ** 2).sum(dim=-1)).clamp(min=1e-8)
+    vec_norm = torch.sqrt((vec ** 2).sum(dim=-1)).clamp(min=1e-8)
+    theta = torch.atan2(vec_norm, w)
+    u_hat = vec / vec_norm.unsqueeze(-1).clamp(min=1e-8)
+    log_scalar = torch.log(full_norm)
+    log_vec = theta.unsqueeze(-1) * u_hat
+    log_q = torch.cat([log_scalar.unsqueeze(-1), log_vec], dim=-1)  # (d/4, 4)
+    keys = []
+    for i in range(num_keys):
+        p = i / max(num_keys - 1, 1)
+        plq = p * log_q
+        s, v = plq[..., 0], plq[..., 1:]
+        v_norm = torch.sqrt((v ** 2).sum(dim=-1)).clamp(min=1e-8)
+        v_hat = v / v_norm.unsqueeze(-1).clamp(min=1e-8)
+        exp_s = torch.exp(s)
+        rw = exp_s * torch.cos(v_norm)
+        rv = exp_s.unsqueeze(-1) * torch.sin(v_norm).unsqueeze(-1) * v_hat
+        key = torch.cat([rw.unsqueeze(-1), rv], dim=-1).flatten(-2)
+        keys.append(key)
+    return torch.stack(keys)
+
+
+class CliffordRouter(nn.Module):
+    """Clifford algebra router. Supports complex (Cl(1,0), equivalent to HRR)
+    and quaternion (Cl(0,2)) algebras with random or FPE key generation."""
+
+    def __init__(self, dim, num_experts, algebra='quaternion', key_mode='fpe'):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.algebra = algebra
+        self.key_mode = key_mode
+        if algebra == 'quaternion':
+            assert dim % 4 == 0, f"Quaternion requires dim % 4 == 0, got {dim}"
+        self.register_buffer('memory', torch.zeros(dim))
+        self.register_buffer('expert_ids', torch.zeros(num_experts, dim))
+        self.register_buffer('expert_keys', torch.zeros(num_experts, dim))
+
+    def _bind(self, a, b):
+        if self.algebra == 'complex':
+            return hrr_bind(a, b)
+        return quat_bind(a, b)
+
+    def _unbind(self, memory, x):
+        if self.algebra == 'complex':
+            return hrr_unbind(memory, x)
+        return quat_unbind(memory, x)
+
+    def init_buffers(self):
+        device = self.memory.device
+        if self.key_mode == 'random':
+            keys = torch.randn(self.num_experts, self.dim, device=device)
+        elif self.key_mode == 'fpe':
+            base = torch.randn(self.dim, device=device)
+            if self.algebra == 'quaternion':
+                keys = make_quat_fpe_keys(base, self.num_experts)
+            else:
+                keys = make_fpe_keys(base, self.num_experts)
+        else:
+            raise ValueError(f"Unknown key_mode: {self.key_mode}")
+        if self.algebra == 'quaternion':
+            keys = quat_normalize(keys)
+            ids = quat_normalize(torch.randn(self.num_experts, self.dim, device=device))
+        else:
+            keys = F.normalize(keys, dim=-1)
+            ids = F.normalize(torch.randn(self.num_experts, self.dim, device=device), dim=-1)
+        memory = sum(self._bind(keys[i], ids[i]) for i in range(self.num_experts))
+        self.memory.copy_(memory)
+        self.expert_ids.copy_(ids)
+        self.expert_keys.copy_(keys)
+
+    def forward(self, x):
+        retrieved = self._unbind(
+            self.memory.float().unsqueeze(0).expand(x.shape[0], -1),
+            x.float()
+        )
+        scores = retrieved @ self.expert_ids.float().T
+        return scores.to(x.dtype)
+
+
+# --- Routers ---
+
 class VSARouter(nn.Module):
     """VSA/HRR router: bundles (key, id) pairs into a single holographic memory.
     Routes by unbinding the token from memory and comparing to expert identifiers.
@@ -235,6 +359,12 @@ class MoELayer(nn.Module):
         elif config.moe_router_type in ('vsa_random', 'vsa_fpe'):
             mode = 'random' if config.moe_router_type == 'vsa_random' else 'fpe'
             self.router = VSARouter(config.n_embd, config.num_experts, mode=mode)
+        elif config.moe_router_type.startswith('clifford_'):
+            parts = config.moe_router_type.split('_')
+            algebra_map = {'quat': 'quaternion', 'complex': 'complex'}
+            algebra = algebra_map[parts[1]]
+            key_mode = parts[2]
+            self.router = CliffordRouter(config.n_embd, config.num_experts, algebra=algebra, key_mode=key_mode)
         else:
             raise ValueError(f"Unknown moe_router_type: {config.moe_router_type}")
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.num_experts)])
@@ -365,7 +495,7 @@ class GPT(nn.Module):
                     # Linear router: small normal init so routing starts near-uniform
                     torch.nn.init.normal_(block.moe.router.weight, mean=0.0, std=0.01)
                 elif hasattr(block.moe.router, 'init_buffers'):
-                    # VSA router: compute and fill holographic memory buffers
+                    # VSA / Clifford / DirectFPE router: compute and fill buffers
                     block.moe.router.init_buffers()
                 # Expert MLPs: same init as dense MLP
                 for expert in block.moe.experts:
