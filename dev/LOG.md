@@ -15,8 +15,8 @@ Reference numbers: d8 router latency fpe/vsa 0.84 ms vs hash 0.12 ms; hash utili
 exactly uniform; other routers peak 0.19–0.24 token fraction in the worst layer.
 
 New work lives in `hf/` (branch `hf-experiments`): rerun the comparison in the
-standard HF stack, then swap routers into pretrained OLMoE. Full plan reviewed
-2026-08-09; summary:
+standard HF stack, then swap routers into pretrained OLMoE. Full plan and
+design rationale in `docs/HF_PORT_PLAN.md`; summary:
 
 **Phase A — from-scratch replication, host conventions.** Random-init
 `OlmoeForCausalLM` (transformers 4.57.3, pinned `<5`: the gate contract flips in 5.x),

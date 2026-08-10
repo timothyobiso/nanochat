@@ -73,7 +73,7 @@ Everything lives under `$NANOCHAT_BASE_DIR` (defaults to `~/.cache/nanochat`; `s
 
 ## HF-ecosystem experiments (`hf/`)
 
-Port of the router comparison to the HuggingFace stack plus router-swap experiments on pretrained OLMoE-1B-7B (branch `hf-experiments`; run matrices and rationale in the 2026-08-09 `dev/LOG.md` entry).
+Port of the router comparison to the HuggingFace stack plus router-swap experiments on pretrained OLMoE-1B-7B (branch `hf-experiments`). **Full plan and design rationale: `docs/HF_PORT_PLAN.md`**; condensed run matrices in the 2026-08-09 `dev/LOG.md` entry.
 
 - **transformers is pinned `>=4.57.3,<5`**: the `OlmoeSparseMoeBlock.gate` contract flips in 5.x (gate returns a 3-tuple, aux-loss collection matches on `isinstance(OlmoeTopKRouter)`). Migration notes in `hf/patch_olmoe.py`'s docstring.
 - Install: `uv sync --extra gpu --group hf` (Mac dev: `--extra cpu --group hf`).
