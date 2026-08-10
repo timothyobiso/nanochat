@@ -238,6 +238,9 @@ hf/diagnose_router.py  B0: agreement / seeds / swap / distill
 hf/heal_olmoe.py       B1: calibration + anneal + drift telemetry
 hf/eval_lm.py          lm-eval wrapper, patched-checkpoint-aware
 hf/analysis.py         figures mirroring scripts/paper_analysis.py
+hf/run_phase_a.sh      node driver: setup/data/pilot/matrix/ablations/figures
+hf/run_phase_b.sh      node driver: baseline gate/B0/heal (pulls best seed +
+                       perms from the B0 report)/milestone evals/figures
 tests/test_hf_*.py     24 CPU tests: bit-exact router parity with nanochat init,
                        patched fwd/bwd for every router type, save/load
                        round-trips, blend semantics, loader resume, fit math

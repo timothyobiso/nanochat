@@ -81,6 +81,12 @@ Port of the router comparison to the HuggingFace stack plus router-swap experime
 - **Patched checkpoints must load via `hf.patch_olmoe.load_router_olmoe`** — bare `from_pretrained` silently rebuilds an unpatched model with a random gate. `hf/eval_lm.py` handles this automatically.
 
 ```bash
+# Cluster drivers (run every stage in order, or --only STAGE; both idempotent —
+# runs with an existing metrics.jsonl are skipped):
+bash hf/run_phase_a.sh --only pilot     # setup, data, pilot, matrix, ablations, figures
+bash hf/run_phase_b.sh --only baseline  # baseline, b0, heal, evals, figures
+
+# Individual stages:
 python -m hf.prepare_data --data-dir <dir> --num-tokens 30000000000   # FineWeb-Edu -> uint16 shards (OLMoE tokenizer)
 torchrun --standalone --nproc_per_node=8 -m hf.train_olmoe -- --data-dir <dir> --out-dir <runs> --run-name S_vsa_fpe --router vsa_fpe --hidden-size 512 --num-layers 8 --num-heads 8   # Phase A
 python -m hf.diagnose_router --data-dir <dir> --out b0_report.json    # B0: agreement/seeds/swap-ppl/distill (1 GPU)
