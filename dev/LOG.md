@@ -4,6 +4,59 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-08-09: HF-ecosystem port of the router experiments (plan + matrices)
+
+The original MoE router runs (never logged here — matrix reconstructed from
+`old_speedruns/*.sh` and the committed `paper_figures/` PDFs) were:
+routers {linear, hash, vsa_random, vsa_fpe, direct_fpe} × depths {4, 8, 10, 12, 16},
+8 experts top-2, `moe_layer_freq=2`, aux coeff 0.01, Chinchilla 20:1 on total params,
+Muon+AdamW, topk-then-softmax gating, router-logit noise std 0.01 during training.
+Reference numbers: d8 router latency fpe/vsa 0.84 ms vs hash 0.12 ms; hash utilization
+exactly uniform; other routers peak 0.19–0.24 token fraction in the worst layer.
+
+New work lives in `hf/` (branch `hf-experiments`): rerun the comparison in the
+standard HF stack, then swap routers into pretrained OLMoE. Full plan reviewed
+2026-08-09; summary:
+
+**Phase A — from-scratch replication, host conventions.** Random-init
+`OlmoeForCausalLM` (transformers 4.57.3, pinned `<5`: the gate contract flips in 5.x),
+MoE every layer, 8 experts top-2, softmax-then-topk, `norm_topk_prob=False`, no router
+noise, AdamW β=(0.9,0.95) wd 0.1 clip 1.0, cosine→10% peak, 1% warmup, seq 2048,
+global batch 524,288 tokens, FineWeb-Edu tokenized with the OLMoE tokenizer.
+
+| Size | d | L | Total | Active | Tokens (20:1) | Peak LR |
+|------|-----|----|-------|--------|---------------|---------|
+| S | 512 | 8 | ~110M | ~73M | 2.2B | 6e-4 |
+| M | 768 | 12 | ~275M | ~148M | 5.5B | 5e-4 |
+| L | 1024 | 16 | ~573M | ~271M | 11.5B | 4e-4 |
+
+Runs: 5 routers {linear, hash, vsa_random, vsa_fpe, direct_fpe} × (S×2 seeds, M×2, L×1)
+= 25 + ablations (aux-coeff-0 at S; `norm_topk_prob=True` probe at S; clifford_quat_fpe
+at M as stretch). ~2.5 node-days at 10–15% MFU assumption, re-baselined after the pilot.
+
+**Phase B0 — OLMoE-1B-7B-0924 diagnostics (no training).** Baseline lm-eval sanity gate
+first (must match published numbers within ~1 pt). Then per-layer routing agreement
+(top-1 / top-8 Jaccard) after Hungarian matching on the top-1 confusion matrix; FPE seed
+search (~512 seeds); hard-swap perplexity (all layers + one-at-a-time); least-squares
+distillation of each learned gate into VSA structure (closed-form memory-only fit = 64×
+compression; alternating memory+ids fit = param-matched).
+
+**Phase B1 — healing, 4 conditions × 5B tokens** (vsa_fpe blend+heal, vsa_random
+blend+heal, control with untouched gate, vsa_fpe hard-swap): global batch 2M tokens
+(512×4096) → 2,500 steps, LR cosine 5e-5→5e-6, alpha 1→0 linear over first 750 steps,
+per-layer scale calibration (std-match) on 2M tokens before training, DDP+ZeRO-1 with
+bf16 params / sharded fp32 Adam states / gradient checkpointing. Headline metric:
+tokens-to-recover-control-ppl. lm-eval (MMLU 5-shot, HellaSwag, ARC-e/c, PIQA,
+WinoGrande, BoolQ) at 0/1B/2.5B/5B.
+
+**Known risks tracked:** FPE key crowding at E=64 (adjacent fractional powers highly
+correlated — seed search is the mitigation, vsa_random the fallback); fixed routers ×
+`norm_topk_prob=False` under-weight the MoE branch (gate-mass telemetry + norm probe);
+patched checkpoints must load via `hf.patch_olmoe.load_router_olmoe`, never bare
+`from_pretrained`.
+
+---
+
 ## 2026-01-11: Per-Layer Residual Scalars (x0 & resid lambdas)
 
 Cherry-picked an idea from modded-nanogpt around learnable per-layer residual connections.

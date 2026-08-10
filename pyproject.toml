@@ -19,7 +19,10 @@ dependencies = [
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
     "torch>=2.9.0",
-    "transformers>=4.57.3",
+    # <5 cap: the OlmoeSparseMoeBlock gate contract flips in transformers 5.x
+    # (gate becomes OlmoeTopKRouter returning a 3-tuple; aux-loss collection
+    # matches on isinstance(OlmoeTopKRouter)) — see hf/patch_olmoe.py.
+    "transformers>=4.57.3,<5",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -27,6 +30,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+]
+# HF-ecosystem router experiments (hf/ package): uv sync --extra gpu --group hf
+hf = [
+    "accelerate>=1.2",       # lm-eval requirement + device_map utilities
+    "lm-eval>=0.4.8,<0.5",   # pinned below releases requiring transformers>=5
+    "hf-transfer>=0.1.8",    # fast OLMoE checkpoint download
 ]
 
 [tool.pytest.ini_options]
