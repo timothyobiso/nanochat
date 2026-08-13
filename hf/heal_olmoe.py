@@ -7,11 +7,10 @@ Conditions (--condition):
   hard_swap  Same gates but alpha pinned at 0 from step 0 (no-anneal ablation).
   control    Untouched learned gate, same data/budget (the comparison line).
 
-Before training (blend/hard_swap): a calibration pass over --calib-tokens sets
-each layer's `scale` so fixed-router logits match the learned gate's logit std.
-Optionally apply Hungarian expert permutations from a B0 report
-(--b0-report, produced by hf.diagnose_router) and pick --router-seed from its
-seed search.
+Before training (blend/hard_swap): a calibration pass sets each layer's `scale`
+so fixed-router logits match the learned gate's logit std. Optionally apply
+Hungarian expert permutations from a B0 report (--b0-report, produced by
+hf.diagnose_router) and pick --router-seed from its seed search.
 
 8xH100:
   torchrun --standalone --nproc_per_node=8 -m hf.heal_olmoe -- \
@@ -22,7 +21,13 @@ seed search.
 Memory: default keeps fp32 params + bf16 autocast + gradient checkpointing +
 ZeRO-1-sharded Adam states (~63GB/GPU + activations on 8 GPUs for 6.9B params).
 If that doesn't fit, --param-dtype bfloat16 drops params/grads/states to bf16
-(~35GB) at some optimizer-precision risk. FSDP is the documented fallback.
+(~35GB) at some optimizer-precision risk — this is what the 8x48GB SLURM jobs
+in hf/slurm/ use. FSDP is the documented fallback.
+
+Resume: --resume <run>/step_N restores model, optimizer, data position and the
+drift reference, so a run split across wall-clock-limited jobs continues rather
+than restarting. Calibration and B0 permutations are skipped on resume because
+`scale` and `alpha` are persistent buffers that ride in the checkpoint.
 """
 
 import argparse
@@ -38,11 +43,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from transformers.models.olmoe.modeling_olmoe import OlmoeForCausalLM
 
+from hf.checkpoints import latest_checkpoint, mark_done, prune_checkpoints
 from hf.data import distributed_data_loader, tokens_per_byte
 from hf.diagnose_router import MoeInputCatcher
-from hf.patch_olmoe import patch_olmoe_routers, save_router_olmoe
+from hf.patch_olmoe import load_router_olmoe, patch_olmoe_routers, save_router_olmoe
 from hf.routers import BlendedRouterGate, calibrate_scale, permute_expert_ids
 from hf.train_olmoe import autocast_ctx, evaluate_bpb, expert_telemetry, forward_loss, lr_multiplier, setup_dist
+
+# lm-eval milestones as fractions of the run (5B-token default -> steps 500/1250/2500).
+# These checkpoints keep their model/ through pruning; hf/slurm/06_evals.sbatch
+# reads the resolved steps back out of config.json.
+MILESTONE_FRACS = (0.2, 0.5, 1.0)
 
 
 def get_args():
@@ -56,7 +67,8 @@ def get_args():
     p.add_argument("--router", type=str, default="vsa_fpe")
     p.add_argument("--router-seed", type=int, default=0, help="use the best seed from the B0 seed search")
     p.add_argument("--b0-report", type=str, default="", help="apply Hungarian perms from this diagnose_router report")
-    p.add_argument("--calib-tokens", type=int, default=2_000_000)
+    p.add_argument("--calib-tokens", type=int, default=65_536,
+                   help="hidden states sampled per layer for scale calibration (held on CPU)")
     # schedule (defaults = the plan's 5B-token condition)
     p.add_argument("--num-tokens", type=int, default=5_000_000_000)
     p.add_argument("--total-batch-size", type=int, default=2_097_152, help="tokens per step (512 x 4096)")
@@ -74,6 +86,7 @@ def get_args():
     p.add_argument("--telemetry-every", type=int, default=100)
     p.add_argument("--save-every", type=int, default=250)
     p.add_argument("--eval-tokens", type=int, default=4_194_304)
+    p.add_argument("--resume", type=str, default="", help="checkpoint dir (…/step_N), or 'auto' for the newest in the run dir")
     p.add_argument("--device", type=str, default="")
     p.add_argument("--run", type=str, default="dummy")
     return p.parse_args()
@@ -84,9 +97,16 @@ def blended_gates(model):
 
 
 def apply_b0_perms(model, report_path, router_type):
+    """Reorder each router's experts to the Hungarian match from a B0 report.
+    A report produced with --mode seeds (or without this router in --routers)
+    carries no perms; say so and continue rather than dying with a KeyError
+    after the 6.9B model is already on device."""
     with open(report_path) as f:
         report = json.load(f)
-    perms = report["agreement"][router_type]
+    perms = report.get("agreement", {}).get(router_type)
+    if not perms:
+        print(f"warning: {report_path} has no agreement perms for '{router_type}'; skipping")
+        return
     for i, layer in enumerate(model.model.layers):
         if isinstance(layer.mlp.gate, BlendedRouterGate) and str(i) in perms:
             permute_expert_ids(layer.mlp.gate.router, perms[str(i)]["perm"])
@@ -94,8 +114,14 @@ def apply_b0_perms(model, report_path, router_type):
 
 @torch.no_grad()
 def calibrate_all_scales(model, args, device, rank):
-    """Run --calib-tokens through the frozen model, then std-match each layer's
-    fixed-router logits to its learned gate's."""
+    """Sample --calib-tokens hidden states per layer from the frozen model, then
+    std-match each layer's fixed-router logits to its learned gate's.
+
+    The sample is held on CPU in fp16 and moved back one layer at a time. Keeping
+    it on device would cost calib_tokens * hidden * 4 bytes per layer — at OLMoE
+    scale (2048 hidden, 16 MoE layers) that is ~130 GB per rank at only 1M
+    tokens. A std ratio needs a sample, not the whole stream.
+    """
     gates = {i: layer.mlp.gate for i, layer in enumerate(model.model.layers)
              if isinstance(layer.mlp.gate, BlendedRouterGate)}
     catcher = MoeInputCatcher(model, list(gates.keys()))
@@ -106,13 +132,16 @@ def calibrate_all_scales(model, args, device, rank):
         inputs, _, _ = next(loader)
         with autocast_ctx(device):
             model(input_ids=inputs)
+        take = min(inputs.numel(), args.calib_tokens - seen)
         for i in gates:
-            hidden[i].append(catcher.hidden[i].float())
-        seen += inputs.numel()
+            hidden[i].append(catcher.hidden[i][:take].to("cpu", torch.float16))
+        seen += take
     catcher.remove()
     scales = {}
     for i, gate in gates.items():
-        scales[i] = calibrate_scale(gate, torch.cat(hidden[i]), method="std")
+        sample = torch.cat(hidden.pop(i)).to(device, torch.float32)
+        scales[i] = calibrate_scale(gate, sample, method="std")
+        del sample
     if rank == 0:
         print("calibrated scales:", {i: round(s, 4) for i, s in scales.items()})
     return scales
@@ -158,18 +187,37 @@ def main():
     assert args.total_batch_size % (B * T * world) == 0
     grad_accum = args.total_batch_size // (B * T * world)
     num_iterations = args.num_tokens // args.total_batch_size
+    # round each milestone up to a save boundary so the checkpoint actually exists
+    save_every = max(1, args.save_every)
+    milestones = sorted({min(num_iterations, math.ceil(num_iterations * f / save_every) * save_every)
+                         for f in MILESTONE_FRACS})
 
     param_dtype = torch.float32 if args.param_dtype == "float32" else torch.bfloat16
-    model = OlmoeForCausalLM.from_pretrained(args.model, dtype=param_dtype, revision=args.revision)
+    swapped = args.condition in ("blend", "hard_swap")
+    resume = (latest_checkpoint(run_dir) or "") if args.resume == "auto" else args.resume
+    trainer_state, start_step = None, 0
+    if resume:
+        # scale/alpha are persistent buffers, so the checkpoint already carries a
+        # calibrated, permuted, correctly-annealed gate — rebuilding it would
+        # recalibrate against an already-drifted model.
+        ckpt = os.path.join(resume, "model")
+        model = (load_router_olmoe(ckpt, dtype=param_dtype) if swapped
+                 else OlmoeForCausalLM.from_pretrained(ckpt, dtype=param_dtype))
+        trainer_state = torch.load(os.path.join(resume, "trainer_state.pt"), weights_only=True)
+        start_step = trainer_state["step"]
+        if is_main:
+            print(f"resuming {args.run_name} from step {start_step}/{num_iterations}")
+    else:
+        model = OlmoeForCausalLM.from_pretrained(args.model, dtype=param_dtype, revision=args.revision)
+        if swapped:
+            patch_olmoe_routers(model, args.router, seed=args.router_seed, blend=True)
+            if args.b0_report:
+                apply_b0_perms(model, args.b0_report, args.router)
     model.config.use_cache = False
-    if args.condition in ("blend", "hard_swap"):
-        patch_olmoe_routers(model, args.router, seed=args.router_seed, blend=True)
-        if args.b0_report:
-            apply_b0_perms(model, args.b0_report, args.router)
     model = model.to(device)
     model.gradient_checkpointing_enable()
 
-    if args.condition in ("blend", "hard_swap"):
+    if swapped and not resume:
         calibrate_all_scales(model, args, device, rank)
         if args.condition == "hard_swap":
             for gate in blended_gates(model):
@@ -177,7 +225,10 @@ def main():
 
     top_k = model.config.num_experts_per_tok
     probe_inputs, _, _ = next(distributed_data_loader(args.data_dir, "val", min(B, 2), T, device=device))
-    reference = routing_reference(model, probe_inputs, top_k)
+    # the drift reference is the pre-swap learned-gate routing; recomputing it
+    # after a resume would re-baseline against a gate that has already moved.
+    reference = (trainer_state["reference"] if trainer_state is not None
+                 else routing_reference(model, probe_inputs, top_k))
 
     raw_model = model
     model.train()
@@ -190,8 +241,11 @@ def main():
     else:
         optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                                       weight_decay=args.weight_decay)
+    if trainer_state is not None:
+        optimizer.load_state_dict(trainer_state["optimizer"])
 
-    loader = distributed_data_loader(args.data_dir, "train", B, T, rank=rank, world_size=world, device=device)
+    loader = distributed_data_loader(args.data_dir, "train", B, T, rank=rank, world_size=world,
+                                     device=device, start_step=start_step * grad_accum)
     tpb = tokens_per_byte(args.data_dir, "val")
     aux_coeff = raw_model.config.router_aux_loss_coef
 
@@ -199,7 +253,8 @@ def main():
     if is_main:
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "config.json"), "w") as f:
-            json.dump({**vars(args), "num_iterations": num_iterations, "world_size": world}, f, indent=2)
+            json.dump({**vars(args), "num_iterations": num_iterations, "world_size": world,
+                       "milestone_steps": milestones}, f, indent=2)
         if args.run != "dummy":
             import wandb
             wandb_run = wandb.init(project="nanochat-hf-heal", name=args.run, config=vars(args))
@@ -212,8 +267,8 @@ def main():
             if wandb_run is not None:
                 wandb_run.log({k: v for k, v in record.items() if isinstance(v, (int, float))}, step=record["step"])
 
-    t0 = time.time()
-    for step in range(num_iterations):
+    t0, tokens_seen = time.time(), 0
+    for step in range(start_step, num_iterations):
         if args.condition == "blend":
             alpha = max(0.0, 1.0 - step / max(1, args.anneal_steps))
             for gate in blended_gates(raw_model):
@@ -239,9 +294,10 @@ def main():
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        tokens_seen += args.total_batch_size
 
         if is_main and step % 10 == 0:
-            tok_s = (step + 1) * args.total_batch_size / (time.time() - t0)
+            tok_s = tokens_seen / max(1e-9, time.time() - t0)
             print(f"step {step:5d}/{num_iterations} | loss {loss_acc:.4f} | alpha {alpha:.3f} | "
                   f"lr {args.lr * lr_mult:.2e} | gnorm {grad_norm:.2f} | {tok_s/1e3:.0f}k tok/s")
         log({"step": step, "train_loss": round(loss_acc, 5), "alpha": alpha,
@@ -265,12 +321,15 @@ def main():
                     raw_model.save_pretrained(os.path.join(ckpt, "model"))
                 else:
                     save_router_olmoe(raw_model, os.path.join(ckpt, "model"))
-                torch.save({"step": step + 1, "optimizer": optimizer.state_dict()},
+                torch.save({"step": step + 1, "optimizer": optimizer.state_dict(), "reference": reference},
                            os.path.join(ckpt, "trainer_state.pt"))
+                prune_checkpoints(run_dir, keep_models=milestones)
                 print(f"saved {ckpt}")
             if world > 1:
                 dist.barrier()
 
+    if is_main:
+        mark_done(run_dir)
     if wandb_run is not None:
         wandb_run.finish()
     if world > 1:
