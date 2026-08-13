@@ -1,13 +1,47 @@
 """Math tests for hf/diagnose_router.py: Hungarian alignment, Jaccard,
-and the VSA distillation fits."""
+the VSA distillation fits, and B0 seed selection."""
+
+import json
 
 import torch
 
 from nanochat.gpt import hrr_unbind
-from hf.diagnose_router import alt_fit, distill_metrics, hungarian_perm, iso_fit_memory, topk_jaccard
+from hf.diagnose_router import (
+    alt_fit,
+    best_seed_for,
+    distill_metrics,
+    hungarian_perm,
+    iso_fit_memory,
+    topk_jaccard,
+)
 from hf.routers import build_router
 
 DIM, EXPERTS = 64, 8
+
+
+def write_report(tmp_path, report):
+    path = tmp_path / "b0_report.json"
+    path.write_text(json.dumps(report))
+    return str(path)
+
+
+def test_best_seed_only_applies_to_the_router_it_was_searched_under(tmp_path):
+    """The seed search scores one router's key construction. Carrying its winner
+    to a different router would dress an arbitrary seed up as a tuned one, so
+    anything but an exact router match falls back to the default."""
+    path = write_report(tmp_path, {
+        "seed_search": {"router": "vsa_fpe", "top16": [{"seed": 314, "top1_mean": 0.4}]}
+    })
+    assert best_seed_for(path, "vsa_fpe") == 314
+    assert best_seed_for(path, "vsa_random") == 0
+
+
+def test_best_seed_falls_back_on_missing_or_partial_reports(tmp_path):
+    """A report from --mode agreement (or no report at all) must not crash the
+    healing launcher — hf/run_phase_b.sh calls this before every condition."""
+    assert best_seed_for(str(tmp_path / "nonexistent.json"), "vsa_fpe") == 0
+    assert best_seed_for(write_report(tmp_path, {"agreement": {}}), "vsa_fpe") == 0
+    assert best_seed_for(write_report(tmp_path, {"seed_search": {"router": "vsa_fpe"}}), "vsa_fpe") == 0
 
 
 def test_hungarian_perm_recovers_relabeling():

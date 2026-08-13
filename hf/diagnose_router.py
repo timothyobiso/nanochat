@@ -29,6 +29,7 @@ beyond one hidden-state subsample for seeds/distill.
 import argparse
 import json
 import math
+import os
 from contextlib import contextmanager
 
 import torch
@@ -242,6 +243,29 @@ def run_seed_search(model, args, layer_indices, device, report):
     return report
 
 
+def best_seed_for(report_path, router_type, default=0):
+    """Winning base seed from a B0 seed search, but only for the router it was
+    actually searched under (--distill-router, default vsa_fpe).
+
+    The search scores seeds by top-1 agreement with the learned gate using one
+    router's key construction. FPE keys are fractional powers of a base vector
+    and vsa_random's are independent unit vectors, so a seed that spaces FPE
+    keys well says nothing about vsa_random — carrying the winner across would
+    dress an arbitrary seed up as a tuned one.
+
+    Used by hf/run_phase_b.sh and hf/slurm/05_heal.sbatch.
+    """
+    try:
+        with open(report_path) as f:
+            search = json.load(f).get("seed_search") or {}
+    except (OSError, ValueError):
+        return default
+    top = search.get("top16") or []
+    if not top or search.get("router") != router_type:
+        return default
+    return top[0]["seed"]
+
+
 # ---------------- swap perplexity ----------------
 
 @contextmanager
@@ -404,10 +428,21 @@ def main():
     model = OlmoeForCausalLM.from_pretrained(args.model, dtype=dtype, revision=args.revision).to(device).eval()
     layer_indices = ([int(x) for x in args.layers.split(",")] if args.layers
                      else [i for i, layer in enumerate(model.model.layers) if hasattr(layer.mlp, "gate")])
-    report = {"model": args.model, "config": vars(args)}
-    modes = ["agreement", "seeds", "swap", "distill"] if args.mode == "all" else [args.mode]
     runners = {"agreement": run_agreement, "seeds": run_seed_search, "swap": run_swap, "distill": run_distill}
+    report_keys = {"agreement": "agreement", "seeds": "seed_search", "swap": "swap", "distill": "distill"}
+
+    # Reuse an existing report so a run killed by a wall-clock limit picks up at
+    # the first unfinished mode instead of redoing hours of diagnostics.
+    report = {"model": args.model, "config": vars(args)}
+    if os.path.exists(args.out):
+        with open(args.out) as f:
+            report = {**json.load(f), "config": vars(args)}
+
+    modes = ["agreement", "seeds", "swap", "distill"] if args.mode == "all" else [args.mode]
     for mode in modes:
+        if report.get(report_keys[mode]) is not None:
+            print(f"[{mode}] already in {args.out}, skipping")
+            continue
         report = runners[mode](model, args, layer_indices, device, report)
         with open(args.out, "w") as f:  # checkpoint the report after each mode
             json.dump(report, f, indent=2)
