@@ -79,21 +79,28 @@ Port of the router comparison to the HuggingFace stack plus router-swap experime
 - Install: `uv sync --extra gpu --group hf` (Mac dev: `--extra cpu --group hf`).
 - Routers are **imported from `nanochat/gpt.py`**, never duplicated. `hf/routers.py:build_router` seeds init deterministically (per-layer seed = base + 1000·layer); `FixedRouterGate`/`BlendedRouterGate` replace the `nn.Linear` gate instance and pin their buffers to fp32 under model-wide bf16 casts.
 - **Patched checkpoints must load via `hf.patch_olmoe.load_router_olmoe`** — bare `from_pretrained` silently rebuilds an unpatched model with a random gate. `hf/eval_lm.py` handles this automatically.
+- **The run matrix lives in `hf/runs.sh`** (`PHASE_A_RUNS`, `PHASE_B_RUNS`, `size_params`), shared by the SLURM jobs and the foreground drivers. Add runs there, not in a driver.
+- **Completion is a `DONE` file, never `metrics.jsonl`** — a run killed partway has metrics but is not finished. Both trainers take `--resume auto` (newest checkpoint in the run dir, or a fresh start) and prune old checkpoints per `hf/checkpoints.py`. `rm -rf` the run dir to genuinely restart.
 
 ```bash
-# Cluster drivers (run every stage in order, or --only STAGE; both idempotent —
-# runs with an existing metrics.jsonl are skipped):
+# SLURM (target: student-gpu-003/004, 8x48GB, 24h cap). Full reference: hf/slurm/README.md
+bash hf/slurm/e2e.sh --check      # preflight: config, venv, nodes, disk
+bash hf/slurm/e2e.sh --dry-run    # print every sbatch line, submit nothing
+bash hf/slurm/e2e.sh              # whole pipeline, dependency-chained
+bash hf/slurm/e2e.sh --only heal  # one stage: data train baseline b0 heal evals figures
+
+# Foreground drivers — same pipeline, one node, no wall-clock cap:
 bash hf/run_phase_a.sh --only pilot     # setup, data, pilot, matrix, ablations, figures
 bash hf/run_phase_b.sh --only baseline  # baseline, b0, heal, evals, figures
 
 # Individual stages:
-python -m hf.prepare_data --data-dir <dir> --num-tokens 30000000000   # FineWeb-Edu -> uint16 shards (OLMoE tokenizer)
+python -m hf.prepare_data --data-dir <dir> --num-tokens 15000000000   # FineWeb-Edu -> uint16 shards (OLMoE tokenizer)
 torchrun --standalone --nproc_per_node=8 -m hf.train_olmoe -- --data-dir <dir> --out-dir <runs> --run-name S_vsa_fpe --router vsa_fpe --hidden-size 512 --num-layers 8 --num-heads 8   # Phase A
 python -m hf.diagnose_router --data-dir <dir> --out b0_report.json    # B0: agreement/seeds/swap-ppl/distill (1 GPU)
-torchrun --standalone --nproc_per_node=8 -m hf.heal_olmoe -- --data-dir <dir> --out-dir <runs> --run-name heal_vsa --condition blend --router vsa_fpe --b0-report b0_report.json   # B1
+torchrun --standalone --nproc_per_node=8 -m hf.heal_olmoe -- --data-dir <dir> --out-dir <runs> --run-name heal_vsa --condition blend --router vsa_fpe --b0-report b0_report.json --param-dtype bfloat16   # B1 (bf16 params required on 48GB)
 python -m hf.eval_lm --model <ckpt-or-name> --out results.json        # lm-eval (baseline gate: match published OLMoE numbers first)
 python -m hf.analysis --mode phase_a --runs <run1>,<run2>             # figures mirroring paper_analysis.py
-python -m pytest tests/test_hf_routers.py tests/test_hf_data.py tests/test_hf_diagnostics.py -v   # all CPU
+python -m pytest tests/ -k hf -v                                      # all CPU
 ```
 
 ## Experiment conventions

@@ -70,10 +70,24 @@ Keeps the routers next to their reference implementation — `hf/routers.py`
 place. Bit-exact parity between the HF-side init and nanochat's is enforced by
 tests, not by convention.
 
-**Compute: one 8xH100 node** (user decision). The local dev machine is an
+**Compute: one 8-GPU node** (user decision). The local dev machine is an
 Apple-Silicon Mac: CPU-only tiny-scale development (MPS lacks the `torch.fft`
 coverage the VSA routers need). Everything in the plan is sized to
 single-node-days.
+
+> **2026-08-13 hardware re-baseline.** The sizing below was costed for 8×H100
+> 80GB. The actual target is `student-gpu-003` / `student-gpu-004`, **8×48GB
+> each, under a 24-hour scheduler cap**. Two consequences:
+>
+> - **Phase B1 must run `--param-dtype bfloat16`** (~35 GB/GPU). The fp32-param
+>   default in §4's memory note needs ~63 GB/GPU and does not fit.
+> - **Wall-clock roughly triples**, so both long stages exceed 24h and are split
+>   across chained, resuming jobs. Phase A ≈ 185 node-hours, Phase B1 ≈ 108;
+>   about a week across the two nodes.
+>
+> Submission, the resume contract, and revised budgets: **`hf/slurm/README.md`**.
+> The run matrix moved to `hf/runs.sh`, shared by the SLURM jobs and the
+> foreground drivers. All estimates remain estimates until the pilot.
 
 **Phase A uses host conventions, not nanochat's** (user decision):
 random-init `OlmoeForCausalLM`, AdamW β=(0.9, 0.95), softmax-then-topk with
@@ -238,12 +252,17 @@ hf/diagnose_router.py  B0: agreement / seeds / swap / distill
 hf/heal_olmoe.py       B1: calibration + anneal + drift telemetry
 hf/eval_lm.py          lm-eval wrapper, patched-checkpoint-aware
 hf/analysis.py         figures mirroring scripts/paper_analysis.py
+hf/runs.sh             the run matrices + size table, shared by every driver
+hf/checkpoints.py      DONE sentinel, newest-checkpoint lookup, retention policy
 hf/run_phase_a.sh      node driver: setup/data/pilot/matrix/ablations/figures
 hf/run_phase_b.sh      node driver: baseline gate/B0/heal (pulls best seed +
                        perms from the B0 report)/milestone evals/figures
-tests/test_hf_*.py     24 CPU tests: bit-exact router parity with nanochat init,
+hf/slurm/              the same pipeline as dependency-chained sbatch jobs, each
+                       under a 24h cap; see hf/slurm/README.md
+tests/test_hf_*.py     33 CPU tests: bit-exact router parity with nanochat init,
                        patched fwd/bwd for every router type, save/load
-                       round-trips, blend semantics, loader resume, fit math
+                       round-trips, blend semantics, Hungarian permutation,
+                       loader resume, B1 trainer resume, fit math, retention
 ```
 
 ## 9. Milestones & status
@@ -251,7 +270,7 @@ tests/test_hf_*.py     24 CPU tests: bit-exact router parity with nanochat init,
 | | Milestone | Gate | Status (2026-08-10) |
 |---|---|---|---|
 | M0 | Env + ground truth | 4.57.3 gate contract verified in installed source; deps resolve | ✅ done |
-| M1 | Routers + patching + tests | pytest green on CPU | ✅ done (14 tests) |
+| M1 | Routers + patching + tests | pytest green on CPU | ✅ done (16 router tests, 33 in total) |
 | M2 | Data pipeline | manifest/loader determinism | ✅ code + CPU tests; node shard build pending |
 | M3 | Phase A trainer + pilot | CPU smoke; node pilot S×{linear, vsa_fpe}; measured MFU | ✅ code + CPU smoke (bit-exact resume); pilot pending |
 | M4 | Phase A matrix + figures | 25 runs; figures render | pending (node) |

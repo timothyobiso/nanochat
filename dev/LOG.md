@@ -4,6 +4,63 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-08-13: SLURM runner for the HF experiments; 8×48GB re-baseline
+
+The HF pipeline is now submittable as dependency-chained sbatch jobs, each under
+a 24-hour cap: `bash hf/slurm/e2e.sh` (`--check` / `--dry-run` / `--only STAGE`).
+Reference: `hf/slurm/README.md`.
+
+**Hardware changed.** Target is `student-gpu-003` / `student-gpu-004`, 8×48GB
+each, not the 8×H100 80GB the plan was costed for. Two consequences:
+
+- B1 must run `--param-dtype bfloat16` (~35 GB/GPU). The fp32-param default
+  needs ~63 GB/GPU and does not fit. (The 2026-08-09 entry below claimed bf16
+  params were already the default — they were not; the code default is fp32,
+  correct for 80GB hardware, and the SLURM job passes bf16 explicitly.)
+- Wall-clock roughly triples. Phase A ≈ 185 node-hours, B1 ≈ 108, so ~a week
+  across two nodes. Phase A's L runs and every B1 condition exceed 24h and are
+  split across chained segments.
+
+**Four blocking bugs found while wiring this up**, all fixed:
+
+1. `heal_olmoe.py` had no `--resume` — it wrote `trainer_state.pt` but always
+   looped from step 0. Every 24h segment would have restarted a 5B-token run.
+   Now mirrors `train_olmoe.py`, and carries the routing-drift reference in the
+   checkpoint (recomputing it post-resume would re-baseline against an
+   already-drifted learned gate). `tests/test_hf_heal_resume.py` proves the
+   continuation is bit-exact by killing a tiny run mid-way and resuming it.
+2. `calibrate_all_scales` accumulated hidden states **on device** until
+   `--calib-tokens` (2M): ~262 GB per rank at OLMoE scale. It would have OOM'd
+   on any GPU. Now a bounded CPU sample; `--calib-tokens` defaults to 65536,
+   which is ample for a std ratio.
+3. Both drivers used `metrics.jsonl` existence as "already done" — a run killed
+   at 5% has one, so a resubmission silently left truncated conditions in the
+   results matrix. Completion is now a `DONE` file written only after the last
+   step (`hf/checkpoints.py`).
+4. Phase A's three ablations derived their run names as `{size}_{router}_s{seed}`
+   with no suffix, so all three collided with matrix runs and were skipped by
+   the same predicate. The matrix moved to `hf/runs.sh` with explicit names.
+
+**Other changes.** Checkpoint retention (newest kept whole, milestones reduced to
+model-only, rest deleted) takes B1 from ~3.3 TB to ~350 GB. B0 and lm-eval now
+skip work already present in their output files, so they chain too. The B0 seed
+search winner is only adopted for the router it was searched under
+(`best_seed_for`) — it was being handed to `vsa_random`, whose keys have nothing
+to do with FPE spacing. `DATA_TOKENS` dropped 30B → 15B: Phase A's largest run
+needs 11.5B and B1 rereads the same shards, and tokenization is the one stage
+that cannot be resumed.
+
+**Kept as-is, deliberately.** Phase A still installs a bare `FixedRouterGate`
+with `norm_topk_prob=False`, so fixed-router gate mass sits near `top_k/E`
+(~0.25) against ~1 for the learned gate — the MoE branch is ~4× down-scaled in
+VSA runs. Rather than deviate from the committed host-fidelity design, the
+`norm_topk_prob=True` probe was widened from one run to `linear` + `vsa_fpe` at
+size S so the effect is measurable. Remaining known gaps (no step-0 lm-eval,
+hash routing depending on batch shape, FPE expert 0 being the binding identity)
+are listed in `hf/slurm/README.md`.
+
+---
+
 ## 2026-08-09: HF-ecosystem port of the router experiments (plan + matrices)
 
 The original MoE router runs (never logged here — matrix reconstructed from
@@ -44,8 +101,9 @@ compression; alternating memory+ids fit = param-matched).
 **Phase B1 — healing, 4 conditions × 5B tokens** (vsa_fpe blend+heal, vsa_random
 blend+heal, control with untouched gate, vsa_fpe hard-swap): global batch 2M tokens
 (512×4096) → 2,500 steps, LR cosine 5e-5→5e-6, alpha 1→0 linear over first 750 steps,
-per-layer scale calibration (std-match) on 2M tokens before training, DDP+ZeRO-1 with
-bf16 params / sharded fp32 Adam states / gradient checkpointing. Headline metric:
+per-layer scale calibration (std-match) before training, DDP+ZeRO-1 with sharded Adam
+states / gradient checkpointing. (Param dtype: the code defaults to fp32, ~63 GB/GPU;
+the 8×48GB runs pass `--param-dtype bfloat16` — see the 2026-08-13 entry.) Headline metric:
 tokens-to-recover-control-ppl. lm-eval (MMLU 5-shot, HellaSwag, ARC-e/c, PIQA,
 WinoGrande, BoolQ) at 0/1B/2.5B/5B.
 
