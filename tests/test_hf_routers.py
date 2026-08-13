@@ -25,6 +25,7 @@ from hf.routers import (
     FixedRouterGate,
     build_router,
     calibrate_scale,
+    permute_expert_ids,
 )
 from hf.patch_olmoe import (
     ROUTER_CONFIG_KEY,
@@ -261,6 +262,34 @@ def test_calibrate_scale_std():
     scaled_std = (s * gate.router(hidden)).std()
     learned_std = learned(hidden).std()
     assert abs(scaled_std / learned_std - 1.0) < 1e-4
+
+
+# ---------------- Hungarian expert permutation ----------------
+
+def test_permute_expert_ids_reindexes_logits():
+    """permute_expert_ids must make router expert perm[e] answer for slot e, so
+    the permuted router's logits equal the original's indexed by perm. Both B0
+    (agreement) and B1 (apply_b0_perms) rely on this alignment; if it were
+    transposed, healing would start from a worse match than no matching at all.
+    """
+    x = torch.randn(16, DIM)
+    perm = torch.randperm(EXPERTS)
+    for router_type in ("vsa_fpe", "vsa_random", "direct_fpe", "clifford_quat_fpe"):
+        router = build_router(router_type, DIM, EXPERTS, TOPK, seed=11)
+        before = router(x)
+        permute_expert_ids(router, perm)
+        after = router(x)
+        assert torch.allclose(after, before[:, perm], atol=1e-6), router_type
+
+
+def test_permute_expert_ids_is_a_noop_for_hash():
+    """HashRouter has no expert identities to reorder — permuting must not
+    raise, since run_phase_b/B0 pass perms uniformly across router types."""
+    router = build_router("hash", DIM, EXPERTS, TOPK, seed=0)
+    x = torch.randn(16, DIM)
+    before = router(x)
+    permute_expert_ids(router, torch.randperm(EXPERTS))
+    assert torch.equal(router(x), before)
 
 
 # ---------------- dtype robustness ----------------
