@@ -10,8 +10,15 @@ set -e
 #   data    tokenize FineWeb-Edu -> uint16 shards (one-time, ~30B tokens)
 #   pilot   size S x {linear, vsa_fpe}: measures real MFU BEFORE the matrix —
 #           re-check the wall-clock estimates in the plan against its tok/s
-#   matrix  5 routers x (S x2 seeds + M x2 seeds + L x1) = 25 runs + ablations
+#   matrix  5 routers x (S x2 seeds + M x2 seeds + L x1) = 25 runs
+#   ablations  5 more (aux-loss-coeff 0, norm_topk_prob probe, clifford stretch)
 #   figures loss curves + utilization heatmaps + router latency
+#
+# The run matrix itself lives in hf/runs.sh, shared with the SLURM jobs in
+# hf/slurm/. This driver runs everything in the foreground on one node; for a
+# scheduler with a wall-clock cap use hf/slurm/e2e.sh instead. Both treat a
+# `DONE` file in the run dir as the completion marker and resume from the newest
+# checkpoint otherwise.
 #
 # Usage:
 #   bash hf/run_phase_a.sh --only pilot
@@ -26,7 +33,8 @@ set -e
 #   --gpus N           (default: 8)
 #   --data-dir DIR     (default: /data/$USER/hf_data/fineweb_edu_olmoe)
 #   --out-dir DIR      (default: /data/$USER/hf_runs)
-#   --data-tokens N    train tokens to tokenize (default: 30000000000)
+#   --data-tokens N    train tokens to tokenize (default: 15000000000 — L needs
+#                      11.5B and Phase B rereads the same shards)
 #   --wandb NAME       wandb run prefix; 'dummy' disables (default: dummy)
 
 ROUTERS="linear,hash,vsa_random,vsa_fpe,direct_fpe"
@@ -34,7 +42,7 @@ SIZES="S,M,L"
 GPUS=8
 DATA_DIR="/data/$(whoami)/hf_data/fineweb_edu_olmoe"
 OUT_DIR="/data/$(whoami)/hf_runs"
-DATA_TOKENS=30000000000
+DATA_TOKENS=15000000000
 ONLY=""
 WANDB="dummy"
 
@@ -56,39 +64,45 @@ export OMP_NUM_THREADS=1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export TOKENIZERS_PARALLELISM=true
 
+mkdir -p "$OUT_DIR"   # tee below opens the log before Python creates the dir
+
+# size_params and the run manifests live in hf/runs.sh so this driver and the
+# SLURM jobs in hf/slurm/ describe the same experiment.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runs.sh"
+
 run_stage() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
+in_list() { [[ ",$2," == *",$1,"* ]]; }
 
-# Per-size hyperparams from the plan table (docs/HF_PORT_PLAN.md §5).
-# device-batch is a starting point — tune at the pilot if OOM/underutilized.
-size_params() {
-    case $1 in
-        S) HIDDEN=512;  LAYERS=8;  HEADS=8;  LR=6e-4; DEV_BS=16 ;;
-        M) HIDDEN=768;  LAYERS=12; HEADS=12; LR=5e-4; DEV_BS=8 ;;
-        L) HIDDEN=1024; LAYERS=16; HEADS=16; LR=4e-4; DEV_BS=4 ;;
-        *) echo "unknown size: $1"; exit 1 ;;
-    esac
-}
-
-train_one() {  # train_one SIZE ROUTER SEED [extra flags...]
-    local size=$1 router=$2 seed=$3; shift 3
+train_entry() {  # train_entry "<name> <size> <router> <seed> [extra flags…]"
+    local name size router seed extra
+    read -r name size router seed extra <<< "$1"
     size_params "$size"
-    local name="${size}_${router}_s${seed}"
-    if [[ -f "$OUT_DIR/$name/metrics.jsonl" ]] && [[ -z "$FORCE" ]]; then
-        echo "=== $name already has metrics.jsonl, skipping (rm to rerun) ==="
+    # DONE, not metrics.jsonl: a run killed partway has metrics but is not done.
+    # rm -rf the run dir to start it over; otherwise it resumes.
+    if [[ -f "$OUT_DIR/$name/DONE" ]]; then
+        echo "=== $name already complete, skipping (rm -rf $OUT_DIR/$name to rerun) ==="
         return 0
     fi
     local wandb_arg="dummy"
     [[ "$WANDB" != "dummy" ]] && wandb_arg="${WANDB}_${name}"
-    echo "=== training $name ==="
+    echo "=== training $name ${extra:+[$extra]} ==="
+    # shellcheck disable=SC2086  # $extra is a deliberate flag list
     torchrun --standalone --nproc_per_node="$GPUS" -m hf.train_olmoe -- \
         --data-dir "$DATA_DIR" --out-dir "$OUT_DIR" --run-name "$name" \
         --router "$router" --router-seed "$seed" --seed "$seed" \
         --hidden-size "$HIDDEN" --num-layers "$LAYERS" --num-heads "$HEADS" \
-        --lr "$LR" --device-batch-size "$DEV_BS" --run "$wandb_arg" "$@" \
+        --lr "$LR" --device-batch-size "$DEV_BS" --resume auto --run "$wandb_arg" $extra \
         2>&1 | tee -a "$OUT_DIR/${name}.log"
 }
 
-seeds_for_size() { case $1 in S|M) echo "0 1" ;; L) echo "0" ;; esac; }
+find_entry() {  # echo the manifest entry whose run name is $1
+    local entry
+    for entry in "${PHASE_A_RUNS[@]}"; do
+        [[ "${entry%% *}" == "$1" ]] && { echo "$entry"; return 0; }
+    done
+    echo "no such run: $1" >&2
+    return 1
+}
 
 # ── setup ────────────────────────────────────────────────────────────────────
 if run_stage setup; then
@@ -110,8 +124,8 @@ fi
 
 # ── pilot: measure MFU before committing the matrix ─────────────────────────
 if run_stage pilot; then
-    for router in linear vsa_fpe; do
-        train_one S "$router" 0
+    for name in "${PHASE_A_PILOT[@]}"; do
+        train_entry "$(find_entry "$name")"
     done
     echo "=== PILOT DONE: check tok/s in the logs above against the plan's"
     echo "=== wall-clock table before running the full matrix."
@@ -119,23 +133,19 @@ fi
 
 # ── matrix ───────────────────────────────────────────────────────────────────
 if run_stage matrix; then
-    for size in ${SIZES//,/ }; do
-        for router in ${ROUTERS//,/ }; do
-            for seed in $(seeds_for_size "$size"); do
-                train_one "$size" "$router" "$seed"
-            done
-        done
+    for entry in "${PHASE_A_MATRIX[@]}"; do
+        read -r _ size router _ <<< "$entry"
+        if in_list "$size" "$SIZES" && in_list "$router" "$ROUTERS"; then
+            train_entry "$entry"
+        fi
     done
 fi
 
 # ── ablations (plan §5 add-ons) ──────────────────────────────────────────────
 if run_stage ablations; then
-    for router in linear vsa_fpe; do  # aux-loss-coeff 0 at S
-        size_params S
-        train_one S "$router" 0 --aux-loss-coeff 0.0 || true
+    for entry in "${PHASE_A_ABLATIONS[@]}"; do
+        train_entry "$entry" || true
     done
-    train_one S vsa_fpe 0 --norm-topk-prob || true   # norm_topk_prob probe
-    train_one M clifford_quat_fpe 0 || true          # stretch
 fi
 
 # ── figures ──────────────────────────────────────────────────────────────────

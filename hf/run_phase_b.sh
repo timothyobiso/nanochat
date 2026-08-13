@@ -62,8 +62,15 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 source .venv/bin/activate 2>/dev/null || true
 mkdir -p "$OUT_DIR"
 
+# condition list shared with hf/slurm/05_heal.sbatch
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runs.sh"
+
 run_stage() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
 B0_REPORT="$OUT_DIR/b0_report.json"
+
+# 48GB cards: fp32 params + ZeRO-1 Adam needs ~63GB/GPU, bf16 ~35GB. Override
+# with PARAM_DTYPE=float32 on 80GB hardware.
+: "${PARAM_DTYPE:=bfloat16}"
 
 # ── baseline gate ────────────────────────────────────────────────────────────
 if run_stage baseline; then
@@ -81,72 +88,89 @@ if run_stage b0; then
 fi
 
 # ── healing conditions ───────────────────────────────────────────────────────
-heal_one() {  # heal_one NAME CONDITION ROUTER [extra flags...]
-    local name=$1 condition=$2 router=$3; shift 3
-    if [[ -f "$OUT_DIR/$name/metrics.jsonl" ]]; then
-        echo "=== $name already has metrics.jsonl, skipping (rm to rerun) ==="
+heal_entry() {  # heal_entry "<name> <condition> <router>"
+    local name condition router
+    read -r name condition router <<< "$1"
+    # DONE, not metrics.jsonl: a run killed partway has metrics but is not done.
+    if [[ -f "$OUT_DIR/$name/DONE" ]]; then
+        echo "=== $name already complete, skipping (rm -rf $OUT_DIR/$name to rerun) ==="
         return 0
+    fi
+    local b0_args=() seed=0
+    if [[ -f "$B0_REPORT" ]]; then
+        b0_args=(--b0-report "$B0_REPORT")
+        seed=$(python -c \
+            'import sys; from hf.diagnose_router import best_seed_for; print(best_seed_for(sys.argv[1], sys.argv[2]))' \
+            "$B0_REPORT" "$router")
     fi
     local wandb_arg="dummy"
     [[ "$WANDB" != "dummy" ]] && wandb_arg="${WANDB}_${name}"
-    echo "=== healing: $name ==="
+    echo "=== healing: $name (router-seed $seed) ==="
     torchrun --standalone --nproc_per_node="$GPUS" -m hf.heal_olmoe -- \
         --model "$MODEL" --data-dir "$DATA_DIR" --out-dir "$OUT_DIR" \
         --run-name "$name" --condition "$condition" --router "$router" \
-        --num-tokens "$NUM_TOKENS" --run "$wandb_arg" "$@" \
+        --router-seed "$seed" --num-tokens "$NUM_TOKENS" --param-dtype "$PARAM_DTYPE" \
+        --resume auto --run "$wandb_arg" "${b0_args[@]}" \
         2>&1 | tee -a "$OUT_DIR/${name}.log"
 }
 
-if run_stage heal; then
-    # best FPE base seed from the B0 seed search (0 if the report lacks one)
-    BEST_SEED=$(python -c "
-import json, sys
-try:
-    r = json.load(open('$B0_REPORT'))
-    print(r['seed_search']['top16'][0]['seed'])
-except Exception:
-    print(0); sys.exit(0)
-")
-    echo "=== using router seed $BEST_SEED (from $B0_REPORT) ==="
-    PERM_ARGS=()
-    [[ -f "$B0_REPORT" ]] && PERM_ARGS=(--b0-report "$B0_REPORT")
-    for cond in ${CONDITIONS//,/ }; do
-        case $cond in
-            control)           heal_one heal_control control linear ;;
-            blend_vsa_fpe)     heal_one heal_blend_vsa_fpe blend vsa_fpe \
-                                   --router-seed "$BEST_SEED" "${PERM_ARGS[@]}" ;;
-            blend_vsa_random)  heal_one heal_blend_vsa_random blend vsa_random \
-                                   --router-seed "$BEST_SEED" "${PERM_ARGS[@]}" ;;
-            hard_swap_vsa_fpe) heal_one heal_hard_swap_vsa_fpe hard_swap vsa_fpe \
-                                   --router-seed "$BEST_SEED" "${PERM_ARGS[@]}" ;;
-            *) echo "unknown condition: $cond"; exit 1 ;;
-        esac
+# entries from PHASE_B_RUNS selected by --conditions (which names them without
+# the shared "heal_" prefix)
+selected_entries() {
+    local entry name cond
+    for entry in "${PHASE_B_RUNS[@]}"; do
+        name="${entry%% *}"
+        for cond in ${CONDITIONS//,/ }; do
+            [[ "$name" == "heal_$cond" ]] && { echo "$entry"; break; }
+        done
     done
+    return 0   # the inner test fails on the last non-match; don't trip set -e
+}
+
+# fail loudly on a typo rather than quietly running nothing
+for cond in ${CONDITIONS//,/ }; do
+    if ! printf '%s\n' "${PHASE_B_RUNS[@]}" | grep -q "^heal_${cond} "; then
+        echo "unknown condition: $cond" >&2
+        echo "known: $(printf '%s\n' "${PHASE_B_RUNS[@]}" | sed 's/^heal_//;s/ .*//' | tr '\n' ' ')" >&2
+        exit 1
+    fi
+done
+
+if run_stage heal; then
+    while read -r entry; do
+        [[ -n "$entry" ]] && heal_entry "$entry"
+    done <<< "$(selected_entries)"
 fi
 
 # ── milestone lm-evals ───────────────────────────────────────────────────────
 if run_stage evals; then
-    # 5B tokens / 2M per step -> step 2500; milestones at 1B/2.5B/5B
-    for step in 000500 001250 002500; do
-        for cond in ${CONDITIONS//,/ }; do
-            name="heal_${cond}"
-            ckpt="$OUT_DIR/$name/step_$step/model"
+    # milestone steps are resolved by heal_olmoe and recorded in config.json, so
+    # they stay correct when --num-tokens changes
+    while read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%% *}"
+        config="$OUT_DIR/$name/config.json"
+        [[ -f "$config" ]] || continue
+        for step in $(python -c "
+import json, sys
+print(' '.join(str(s) for s in json.load(open(sys.argv[1]))['milestone_steps']))" "$config"); do
+            ckpt=$(printf '%s/%s/step_%06d/model' "$OUT_DIR" "$name" "$step")
+            out=$(printf '%s/eval_%s_%06d.json' "$OUT_DIR" "$name" "$step")
             [[ -d "$ckpt" ]] || continue
-            out="$OUT_DIR/eval_${name}_${step}.json"
-            [[ -f "$out" ]] && continue
             python -m hf.eval_lm --model "$ckpt" --out "$out"
         done
-    done
+    done <<< "$(selected_entries)"
 fi
 
 # ── figures ──────────────────────────────────────────────────────────────────
 if run_stage figures; then
     runs=""; labels=""
-    for cond in ${CONDITIONS//,/ }; do
-        name="heal_${cond}"
+    while read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%% *}"
         [[ -f "$OUT_DIR/$name/metrics.jsonl" ]] || continue
-        runs+="$OUT_DIR/$name,"; labels+="${cond},"
-    done
+        runs+="$OUT_DIR/$name,"; labels+="${name#heal_},"
+    done <<< "$(selected_entries)"
     [[ -n "$runs" ]] && python -m hf.analysis --mode healing \
         --runs "${runs%,}" --labels "${labels%,}" --output-dir "$OUT_DIR/figures"
     python -m hf.analysis --mode latency --dim 2048 --experts 64 --top-k 8 \
