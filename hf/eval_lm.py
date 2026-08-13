@@ -51,6 +51,20 @@ def main():
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
 
+    # Resume across a wall-clock kill: keep whatever finished last time and write
+    # after every task, so a preempted eval loses one task rather than all of them.
+    results = {}
+    if os.path.exists(args.out):
+        with open(args.out) as f:
+            results = json.load(f).get("tasks", {})
+
+    # MMLU wants 5-shot; everything else runs 0-shot unless --num-fewshot forces it
+    pending = [(t, args.mmlu_fewshot if t == "mmlu" else args.num_fewshot)
+               for t in args.tasks.split(",") if t not in results]
+    if not pending:
+        print(f"all tasks already in {args.out}, nothing to do")
+        return
+
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
@@ -58,17 +72,12 @@ def main():
     model = load_model(args.model, dtype, args.revision).to(args.device).eval()
     lm = HFLM(pretrained=model, tokenizer=args.tokenizer, batch_size=args.batch_size, device=args.device)
 
-    task_list = args.tasks.split(",")
-    # MMLU wants 5-shot; everything else runs 0-shot unless --num-fewshot forces it
-    grouped = [(t, args.mmlu_fewshot if t == "mmlu" else args.num_fewshot) for t in task_list]
-    results = {}
-    for task, fewshot in grouped:
+    for task, fewshot in pending:
         out = lm_eval.simple_evaluate(model=lm, tasks=[task], num_fewshot=fewshot, limit=args.limit)
         results[task] = out["results"]
         print(task, json.dumps(out["results"].get(task, out["results"]), default=str)[:200])
-
-    with open(args.out, "w") as f:
-        json.dump({"model": args.model, "tasks": results}, f, indent=2, default=str)
+        with open(args.out, "w") as f:
+            json.dump({"model": args.model, "tasks": results}, f, indent=2, default=str)
     print(f"results written to {args.out}")
 
 
