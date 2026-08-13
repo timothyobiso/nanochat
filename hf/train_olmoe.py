@@ -37,11 +37,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import OlmoeConfig
 from transformers.models.olmoe.modeling_olmoe import OlmoeForCausalLM
 
+from hf.checkpoints import latest_checkpoint, mark_done, prune_checkpoints
 from hf.data import distributed_data_loader, tokens_per_byte
 from hf.patch_olmoe import load_router_olmoe, patch_olmoe_routers, save_router_olmoe
 from hf.routers import ROUTER_TYPES
 
 LN2 = math.log(2.0)
+
+# args that define what the run *is*: a resume that changes any of them is
+# describing a different experiment, and load_router_olmoe would silently
+# override --router from the checkpoint spec rather than fail. num_iterations is
+# checked separately — config.json records the resolved step count, not the raw
+# flag, so comparing it against args (-1 by default) would reject every resume.
+RESUME_LOCKED_ARGS = ("router", "router_seed", "seed", "hidden_size", "num_layers", "num_heads",
+                      "num_experts", "num_experts_per_tok", "norm_topk_prob", "aux_loss_coeff",
+                      "vocab_size", "seq_len", "total_batch_size", "lr",
+                      "target_param_data_ratio")
 
 
 def get_args():
@@ -76,7 +87,7 @@ def get_args():
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-tokens", type=int, default=10_485_760)
     p.add_argument("--save-every", type=int, default=-1, help="-1: only at 25/50/75/100%")
-    p.add_argument("--resume", type=str, default="", help="checkpoint dir (…/step_N) to resume from")
+    p.add_argument("--resume", type=str, default="", help="checkpoint dir (…/step_N), or 'auto' for the newest in the run dir")
     p.add_argument("--run", type=str, default="dummy", help="wandb run name; 'dummy' disables wandb")
     p.add_argument("--device", type=str, default="", help="override autodetect (note: VSA routers need torch.fft, incomplete on MPS — use cpu for Mac smokes)")
     return p.parse_args()
@@ -119,6 +130,30 @@ def build_model(args):
     model = OlmoeForCausalLM(config)
     patch_olmoe_routers(model, args.router, seed=args.router_seed)
     return model
+
+
+def check_resume_args(run_dir, args, num_iterations=None):
+    """Refuse a resume whose CLI disagrees with the run it is continuing.
+
+    Called twice: once before the model loads (cheap args), then again once
+    num_iterations has been resolved, since that sets the LR schedule length and
+    silently changing it mid-run would bend the schedule.
+    """
+    path = os.path.join(run_dir, "config.json")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        previous = json.load(f)
+    current = dict(vars(args))
+    keys = RESUME_LOCKED_ARGS
+    if num_iterations is not None:
+        current["num_iterations"] = num_iterations
+        keys = keys + ("num_iterations",)
+    changed = [k for k in keys if k in previous and previous[k] != current[k]]
+    if changed:
+        detail = ", ".join(f"{k}: {previous[k]} -> {current[k]}" for k in changed)
+        raise ValueError(f"resume args disagree with {path} ({detail}); "
+                         f"use a new --run-name to start a different run")
 
 
 def lr_multiplier(step, num_iterations, warmup_frac, final_frac):
@@ -199,10 +234,14 @@ def main():
     grad_accum = args.total_batch_size // (B * T * world)
 
     # ---- model ----
-    if args.resume:
-        model = load_router_olmoe(os.path.join(args.resume, "model"), dtype=torch.float32, device=device)
-        trainer_state = torch.load(os.path.join(args.resume, "trainer_state.pt"), weights_only=True)
+    resume = (latest_checkpoint(run_dir) or "") if args.resume == "auto" else args.resume
+    if resume:
+        check_resume_args(run_dir, args)
+        model = load_router_olmoe(os.path.join(resume, "model"), dtype=torch.float32, device=device)
+        trainer_state = torch.load(os.path.join(resume, "trainer_state.pt"), weights_only=True)
         start_step = trainer_state["step"]
+        if is_main:
+            print(f"resuming {args.run_name} from step {start_step}")
     else:
         model = build_model(args).to(device)
         trainer_state, start_step = None, 0
@@ -216,6 +255,8 @@ def main():
     num_iterations = args.num_iterations
     if num_iterations < 0:
         num_iterations = int(args.target_param_data_ratio * total_params) // args.total_batch_size
+    if resume:
+        check_resume_args(run_dir, args, num_iterations)
 
     if world > 1:
         model = DDP(model, device_ids=[torch.cuda.current_device()] if torch.device(device).type == "cuda" else None)
@@ -235,9 +276,10 @@ def main():
     wandb_run = None
     if is_main:
         os.makedirs(run_dir, exist_ok=True)
-        with open(os.path.join(run_dir, "config.json"), "w") as f:
-            json.dump({**vars(args), "total_params": total_params, "active_params": active_params,
-                       "num_iterations": num_iterations, "world_size": world}, f, indent=2)
+        if not resume:  # keep the original run's record; check_resume_args reads it
+            with open(os.path.join(run_dir, "config.json"), "w") as f:
+                json.dump({**vars(args), "total_params": total_params, "active_params": active_params,
+                           "num_iterations": num_iterations, "world_size": world}, f, indent=2)
         print(f"params: {total_params/1e6:.1f}M total / {active_params/1e6:.1f}M active | "
               f"{num_iterations} steps x {args.total_batch_size} tokens | grad_accum {grad_accum}")
         if args.run != "dummy":
@@ -252,6 +294,8 @@ def main():
             if wandb_run is not None:
                 wandb_run.log({k: v for k, v in record.items() if isinstance(v, (int, float))}, step=record["step"])
 
+    save_marks = {num_iterations * f // 4 for f in (1, 2, 3, 4)}
+
     def save_checkpoint(step):
         if not is_main:
             return
@@ -259,9 +303,9 @@ def main():
         save_router_olmoe(raw_model, os.path.join(ckpt_dir, "model"))
         torch.save({"step": step, "optimizer": optimizer.state_dict()},
                    os.path.join(ckpt_dir, "trainer_state.pt"))
+        prune_checkpoints(run_dir, keep_models=save_marks)
         print(f"saved {ckpt_dir}")
 
-    save_marks = {num_iterations * f // 4 for f in (1, 2, 3, 4)}
     t0, tokens_seen = time.time(), 0
 
     for step in range(start_step, num_iterations):
@@ -306,6 +350,8 @@ def main():
         if world > 1:
             dist.barrier()
 
+    if is_main:
+        mark_done(run_dir)
     if wandb_run is not None:
         wandb_run.finish()
     if world > 1:
